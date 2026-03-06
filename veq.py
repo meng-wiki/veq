@@ -42,7 +42,8 @@ from typing import Any, Dict, Tuple
 import matplotlib
 import numpy as np
 from matplotlib.path import Path as MplPath
-from scipy.interpolate import griddata
+from scipy import fft as sfft
+from scipy.interpolate import CubicSpline, griddata
 from scipy.optimize import least_squares
 
 matplotlib.use("Agg")
@@ -81,6 +82,8 @@ DEFAULT_CASE_CONFIG: Dict[str, Any] = {
     "solver": {
         # [h0, h1, kappa0, kappa1, nu0, nu1, c00, c10, s10, s11, s20, s30]
         "initial_guess": [0.0] * N_X_UNKNOWNS,
+        # Jacobian mode: "jax_ad" (automatic differentiation) or "scipy_fd".
+        "jacobian_mode": "jax_ad",
         # Legacy note:
         # if users still pass 11-dim initial_guess, optional solver.s11 is accepted
         # and inserted as X[9] automatically.
@@ -198,29 +201,69 @@ def load_case_config(case_json_path: str | None) -> Dict[str, Any]:
     return case_cfg
 
 
+def _spectral_periodic_derivative(arr: np.ndarray, spacing: float, axis: int) -> np.ndarray:
+    """Pseudo-spectral first derivative on periodic axis."""
+    a = np.asarray(arr)
+    n = a.shape[axis]
+    k = TWO_PI * sfft.fftfreq(n, d=spacing)
+    shape = [1] * a.ndim
+    shape[axis] = n
+    ik = (1j * k).reshape(shape)
+    a_hat = sfft.fft(a, axis=axis)
+    da = sfft.ifft(ik * a_hat, axis=axis)
+    return da.real if np.isrealobj(a) else da
+
+
 def dd_theta(arr: np.ndarray, dtheta: float) -> np.ndarray:
-    """Periodic central difference in theta (axis=1)."""
-    return (np.roll(arr, -1, axis=1) - np.roll(arr, 1, axis=1)) / (2.0 * dtheta)
+    """Periodic theta-derivative via FFT pseudo-spectral method (axis=1)."""
+    return _spectral_periodic_derivative(arr, dtheta, axis=1)
 
 
 def dd_zeta(arr: np.ndarray, dzeta: float) -> np.ndarray:
-    """Periodic central difference in zeta (axis=2)."""
-    return (np.roll(arr, -1, axis=2) - np.roll(arr, 1, axis=2)) / (2.0 * dzeta)
+    """Periodic zeta-derivative via FFT pseudo-spectral method (axis=2)."""
+    return _spectral_periodic_derivative(arr, dzeta, axis=2)
 
 
 def dd_theta_2d(arr: np.ndarray, dtheta: float) -> np.ndarray:
-    """Periodic central difference for 2D (theta,zeta), theta axis=0."""
-    return (np.roll(arr, -1, axis=0) - np.roll(arr, 1, axis=0)) / (2.0 * dtheta)
+    """2D periodic theta-derivative via FFT (theta axis=0)."""
+    return _spectral_periodic_derivative(arr, dtheta, axis=0)
 
 
 def dd_zeta_2d(arr: np.ndarray, dzeta: float) -> np.ndarray:
-    """Periodic central difference for 2D (theta,zeta), zeta axis=1."""
-    return (np.roll(arr, -1, axis=1) - np.roll(arr, 1, axis=1)) / (2.0 * dzeta)
+    """2D periodic zeta-derivative via FFT (zeta axis=1)."""
+    return _spectral_periodic_derivative(arr, dzeta, axis=1)
 
 
 def dd_rho(arr: np.ndarray, rho_1d: np.ndarray) -> np.ndarray:
-    """Finite difference in rho (axis=0)."""
-    return np.gradient(arr, rho_1d, axis=0, edge_order=2)
+    """
+    Rho-derivative (axis=0):
+    - uniform grid: 4th-order finite differences (interior + one-sided boundaries)
+    - nonuniform grid: cubic-spline derivative
+    """
+    a = np.asarray(arr)
+    rho = np.asarray(rho_1d, dtype=float)
+    if a.shape[0] != rho.size:
+        raise ValueError(f"dd_rho shape mismatch: axis0={a.shape[0]} vs rho={rho.size}.")
+
+    n = rho.size
+    if n < 3:
+        raise ValueError("dd_rho requires at least 3 rho points.")
+
+    dr = np.diff(rho)
+    uniform = np.allclose(dr, dr[0], rtol=1.0e-10, atol=1.0e-14)
+    if (not uniform) or n < 5:
+        cs = CubicSpline(rho, a, axis=0, bc_type="natural")
+        return cs(rho, 1)
+
+    h = dr[0]
+    out = np.empty_like(a, dtype=np.result_type(a.dtype, np.float64))
+
+    out[0] = (-25.0 * a[0] + 48.0 * a[1] - 36.0 * a[2] + 16.0 * a[3] - 3.0 * a[4]) / (12.0 * h)
+    out[1] = (-3.0 * a[0] - 10.0 * a[1] + 18.0 * a[2] - 6.0 * a[3] + a[4]) / (12.0 * h)
+    out[2:-2] = (-a[4:] + 8.0 * a[3:-1] - 8.0 * a[1:-3] + a[:-4]) / (12.0 * h)
+    out[-2] = (3.0 * a[-1] + 10.0 * a[-2] - 18.0 * a[-3] + 6.0 * a[-4] - a[-5]) / (12.0 * h)
+    out[-1] = (25.0 * a[-1] - 48.0 * a[-2] + 36.0 * a[-3] - 16.0 * a[-4] + 3.0 * a[-5]) / (12.0 * h)
+    return out
 
 
 def integrate_surface(f2: np.ndarray, theta_1d: np.ndarray, zeta_1d: np.ndarray) -> float:
@@ -265,7 +308,6 @@ class SolverConfig:
     n_helical: int = -19
     phi_total: float = 1.0
     lambda_reg: float = 1.0e-8
-    eps: float = 1.0e-10
     tol: float = 1.0e-6
     max_nfev: int = 20
     output_dir: str = "veq_output"
@@ -289,14 +331,22 @@ class V3DEquilibriumSolver:
         self.profiles_cfg = case_cfg.get("profiles", {})
         self.lcfs_cfg = case_cfg.get("lcfs", {})
         self.solver_case_cfg = case_cfg.get("solver", {})
+        self.jacobian_mode = str(self.solver_case_cfg.get("jacobian_mode", "jax_ad")).lower()
         self.physical_cfg = case_cfg.get("physical_constants", {})
         self.profile_constants = dict(self.profiles_cfg.get("constants", {}))
         self.lcfs_constants = dict(self.lcfs_cfg.get("constants", {}))
         self.c_light = float(self.physical_cfg.get("c_light", 1.0))
         if abs(self.c_light) < 1.0e-16:
             raise ValueError("physical_constants.c_light cannot be zero.")
+        if self.jacobian_mode not in {"jax_ad", "scipy_fd"}:
+            raise ValueError("solver.jacobian_mode must be one of: jax_ad, scipy_fd.")
 
+        # Full-grid (includes axis rho=0 and boundary rho=1) for geometry.
         self.rho = np.linspace(0.0, 1.0, cfg.n_rho)
+        # Half-grid (cell centers) for thermodynamic / magnetic quantities.
+        self.rho_half = 0.5 * (self.rho[:-1] + self.rho[1:])
+        if self.rho_half.size < 3:
+            raise ValueError("Need at least 4 full-grid rho points to build stable half-grid.")
         self.theta = np.linspace(0.0, TWO_PI, cfg.n_theta, endpoint=False)
         self.zeta = np.linspace(0.0, TWO_PI, cfg.n_zeta, endpoint=False)
         self.drho = self.rho[1] - self.rho[0]
@@ -308,15 +358,23 @@ class V3DEquilibriumSolver:
         )
         self.theta2, self.zeta2 = np.meshgrid(self.theta, self.zeta, indexing="ij")
 
-        # 1D physics profiles (all from dynamic case input)
-        self.P = self._evaluate_profile_expr(str(self.profiles_cfg["pressure_expr"]))
-        self.P_prime = np.gradient(self.P, self.rho, edge_order=2)
-        self.iota = self._evaluate_profile_expr(str(self.profiles_cfg["iota_expr"]))
-        self.Phi = self._evaluate_profile_expr(str(self.profiles_cfg["phi_expr"]))
-        self.Phi_prime = np.gradient(self.Phi, self.rho, edge_order=2)
+        # 1D physics profiles on full-grid and half-grid.
+        self.P = self._evaluate_profile_expr(str(self.profiles_cfg["pressure_expr"]), self.rho)
+        self.P_prime = dd_rho(self.P, self.rho)
+        self.iota = self._evaluate_profile_expr(str(self.profiles_cfg["iota_expr"]), self.rho)
+        self.Phi = self._evaluate_profile_expr(str(self.profiles_cfg["phi_expr"]), self.rho)
+        self.Phi_prime = dd_rho(self.Phi, self.rho)
+
+        self.P_half = self._evaluate_profile_expr(str(self.profiles_cfg["pressure_expr"]), self.rho_half)
+        self.P_prime_half = dd_rho(self.P_half, self.rho_half)
+        self.iota_half = self._evaluate_profile_expr(str(self.profiles_cfg["iota_expr"]), self.rho_half)
+        self.Phi_half = self._evaluate_profile_expr(str(self.profiles_cfg["phi_expr"]), self.rho_half)
+        self.Phi_prime_half = dd_rho(self.Phi_half, self.rho_half)
         # Baseline relation from rotational transform profile.
         self.Psi_prime_iota = self.iota * self.Phi_prime
         self.Psi_iota = self._integrate_profile(self.Psi_prime_iota, self.rho)
+        self.Psi_prime_iota_half = self.iota_half * self.Phi_prime_half
+        self.Psi_iota_half = self._integrate_profile(self.Psi_prime_iota_half, self.rho_half)
         psi_a_raw = self.profiles_cfg.get("psi_a", None)
         self.psi_a = float(self.Psi_iota[-1]) if psi_a_raw is None else float(psi_a_raw)
 
@@ -329,11 +387,11 @@ class V3DEquilibriumSolver:
         # either use fixed boundary constants or fit from LCFS expressions
         self.boundary = self._load_or_fit_boundary()
 
-    def _evaluate_profile_expr(self, expr: str) -> np.ndarray:
+    def _evaluate_profile_expr(self, expr: str, rho_1d: np.ndarray) -> np.ndarray:
         arr = safe_eval_expr(
             expr,
             variables={
-                "rho": self.rho,
+                "rho": rho_1d,
                 "N_t": float(self.cfg.N_t),
                 "n_helical": float(self.cfg.n_helical),
                 "phi_total": float(self.cfg.phi_total),
@@ -341,14 +399,14 @@ class V3DEquilibriumSolver:
             constants=self.profile_constants,
         )
         if arr.ndim == 0:
-            return np.full_like(self.rho, float(arr), dtype=float)
+            return np.full_like(rho_1d, float(arr), dtype=float)
         arr = np.asarray(arr, dtype=float)
-        if arr.shape != self.rho.shape:
+        if arr.shape != rho_1d.shape:
             try:
-                arr = np.broadcast_to(arr, self.rho.shape).astype(float)
+                arr = np.broadcast_to(arr, rho_1d.shape).astype(float)
             except ValueError as exc:
                 raise ValueError(
-                    f"Profile expression must evaluate to shape {self.rho.shape}, got {arr.shape}."
+                    f"Profile expression must evaluate to shape {rho_1d.shape}, got {arr.shape}."
                 ) from exc
         return arr
 
@@ -440,13 +498,13 @@ class V3DEquilibriumSolver:
         out[1:] = np.cumsum(seg)
         return out
 
-    def _compute_psi_from_nu(self, nu_1d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _compute_psi_from_nu(self, nu_1d: np.ndarray, rho_1d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Enforce theoretical constraint:
           psi(rho) = psi_a * rho^2 * [1 + nu(rho)]
         """
-        psi = self.psi_a * (self.rho * self.rho) * (1.0 + nu_1d)
-        psi_prime = np.gradient(psi, self.rho, edge_order=2)
+        psi = self.psi_a * (rho_1d * rho_1d) * (1.0 + nu_1d)
+        psi_prime = dd_rho(psi, rho_1d)
         return psi, psi_prime
 
     def _target_lcfs(self, theta: np.ndarray, zeta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -529,9 +587,9 @@ class V3DEquilibriumSolver:
             s3a=float(p[8]),
         )
 
-    def _radial_profiles(self, X: np.ndarray) -> Dict[str, np.ndarray]:
+    def _radial_profiles(self, X: np.ndarray, rho_1d: np.ndarray) -> Dict[str, np.ndarray]:
         h0, h1, kappa0, kappa1, nu0, nu1, c00, c10, s10, s11, s20, s30 = X
-        r = self.rho
+        r = rho_1d
         r2 = r * r
 
         # h(r)
@@ -596,11 +654,11 @@ class V3DEquilibriumSolver:
             "s3_p": s3_p,
         }
 
-    def _geometry_metrics(self, X: np.ndarray) -> Dict[str, np.ndarray]:
-        prof = self._radial_profiles(X)
-        r = self.rho3
-        th = self.theta3
-        ze = self.zeta3
+    def _geometry_metrics(self, X: np.ndarray, rho_1d: np.ndarray) -> Dict[str, np.ndarray]:
+        prof = self._radial_profiles(X, rho_1d)
+        r = rho_1d[:, None, None]
+        th = self.theta2[None, :, :]
+        ze = self.zeta2[None, :, :]
         a = self.boundary.a
         n = float(self.cfg.n_helical)
 
@@ -677,6 +735,8 @@ class V3DEquilibriumSolver:
         g_tz = R_theta * R_zeta + Z_theta * Z_zeta
 
         return {
+            "rho_1d": rho_1d,
+            "rho3": np.broadcast_to(r, R.shape),
             "R": R,
             "Z": Z,
             "Theta": Theta,
@@ -703,15 +763,17 @@ class V3DEquilibriumSolver:
         }
 
     def _solve_lambda_and_field(
-        self, geom: Dict[str, np.ndarray], psi_prime_1d: np.ndarray
+        self,
+        geom: Dict[str, np.ndarray],
+        psi_prime_1d: np.ndarray,
+        phi_prime_1d: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Solve Lambda coefficients on each rho-surface from weighted J^rho=0:
           ∫∫ sqrt(g) J^rho sin(m*theta - n*zeta) dtheta dzeta = 0
         and reconstruct (Lambda_theta, Lambda_zeta), (B^theta, B^zeta).
         """
-        n_rho = self.cfg.n_rho
-        eps = self.cfg.eps
+        n_rho = int(geom["rho_1d"].size)
 
         # 2D Fourier basis over configurable (m,n) pairs.
         pairs = self.lambda_mode_pairs
@@ -735,22 +797,24 @@ class V3DEquilibriumSolver:
 
         def jrho_2d(i: int, lam_theta: np.ndarray, lam_zeta: np.ndarray) -> np.ndarray:
             sqrtg2 = sqrtg[i]
-            sqrtg_safe = np.where(np.abs(sqrtg2) < eps, np.sign(sqrtg2 + eps) * eps, sqrtg2)
-
-            B_theta = (psi_prime_1d[i] - lam_zeta) / (TWO_PI * sqrtg_safe)
-            B_zeta = (self.Phi_prime[i] + lam_theta) / (TWO_PI * sqrtg_safe)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                B_theta = (psi_prime_1d[i] - lam_zeta) / (TWO_PI * sqrtg2)
+                B_zeta = (phi_prime_1d[i] + lam_theta) / (TWO_PI * sqrtg2)
 
             t1 = dd_theta_2d(g_tz[i] * B_theta + g_zz[i] * B_zeta, self.dtheta)
             t2 = dd_zeta_2d(g_tt[i] * B_theta + g_tz[i] * B_zeta, self.dzeta)
             # For J^rho=0 closure we divide by c (equivalent equation), improving conditioning
             # when c_light uses dimensional SI values.
-            return (t1 - t2) / (4.0 * np.pi * sqrtg_safe)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                jrho = (t1 - t2) / (4.0 * np.pi * sqrtg2)
+            if not np.all(np.isfinite(jrho)):
+                raise FloatingPointError("Non-finite J^rho encountered on half-grid.")
+            return jrho
 
         # solve each rho surface
         I = np.eye(K)
         for i in range(n_rho):
             sqrtg_i = sqrtg[i]
-            sqrtg_safe_i = np.where(np.abs(sqrtg_i) < eps, np.sign(sqrtg_i + eps) * eps, sqrtg_i)
 
             # Base J^rho with Lambda=0
             J0 = jrho_2d(
@@ -764,8 +828,9 @@ class V3DEquilibriumSolver:
             b = -surf_factor * np.einsum("qij,ij->q", ws, J0, optimize=True)
 
             # Linear response dJ/dlambda_p for all p at once (exact due linearity).
-            dB_theta_basis = -dzeta_basis / (TWO_PI * sqrtg_safe_i[None, :, :])
-            dB_zeta_basis = dtheta_basis / (TWO_PI * sqrtg_safe_i[None, :, :])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                dB_theta_basis = -dzeta_basis / (TWO_PI * sqrtg_i[None, :, :])
+                dB_zeta_basis = dtheta_basis / (TWO_PI * sqrtg_i[None, :, :])
             t1_basis = dd_theta(
                 g_tz[i][None, :, :] * dB_theta_basis + g_zz[i][None, :, :] * dB_zeta_basis,
                 self.dtheta,
@@ -774,7 +839,10 @@ class V3DEquilibriumSolver:
                 g_tt[i][None, :, :] * dB_theta_basis + g_tz[i][None, :, :] * dB_zeta_basis,
                 self.dzeta,
             )
-            dJ_basis = (t1_basis - t2_basis) / (4.0 * np.pi * sqrtg_safe_i[None, :, :])  # (K, Nt, Nz)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                dJ_basis = (t1_basis - t2_basis) / (4.0 * np.pi * sqrtg_i[None, :, :])  # (K, Nt, Nz)
+            if not np.all(np.isfinite(dJ_basis)):
+                raise FloatingPointError("Non-finite dJ basis encountered on half-grid.")
 
             # A[q,p] = <sqrtg * dJ_p, sin_q>
             A = surf_factor * np.einsum("qij,pij->qp", ws, dJ_basis, optimize=True)
@@ -789,9 +857,11 @@ class V3DEquilibriumSolver:
         lam_theta_3 = np.tensordot(lam_coeff, dtheta_basis, axes=(1, 0))
         lam_zeta_3 = np.tensordot(lam_coeff, dzeta_basis, axes=(1, 0))
 
-        sqrtg_safe3 = np.where(np.abs(sqrtg) < eps, np.sign(sqrtg + eps) * eps, sqrtg)
-        B_theta = (psi_prime_1d[:, None, None] - lam_zeta_3) / (TWO_PI * sqrtg_safe3)
-        B_zeta = (self.Phi_prime[:, None, None] + lam_theta_3) / (TWO_PI * sqrtg_safe3)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            B_theta = (psi_prime_1d[:, None, None] - lam_zeta_3) / (TWO_PI * sqrtg)
+            B_zeta = (phi_prime_1d[:, None, None] + lam_theta_3) / (TWO_PI * sqrtg)
+        if not (np.all(np.isfinite(B_theta)) and np.all(np.isfinite(B_zeta))):
+            raise FloatingPointError("Non-finite B field encountered on half-grid.")
 
         return lam_coeff, lam_theta_3, B_theta, B_zeta
 
@@ -801,6 +871,8 @@ class V3DEquilibriumSolver:
         B_theta: np.ndarray,
         B_zeta: np.ndarray,
         psi_prime_1d: np.ndarray,
+        phi_prime_1d: np.ndarray,
+        p_prime_1d: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         sqrtg = geom["sqrtg"]
         g_tt = geom["g_tt"]
@@ -809,183 +881,592 @@ class V3DEquilibriumSolver:
         g_rt = geom["g_rt"]
         g_rz = geom["g_rz"]
 
-        eps = self.cfg.eps
-        sqrtg_safe = np.where(np.abs(sqrtg) < eps, np.sign(sqrtg + eps) * eps, sqrtg)
-
         # J^rho
         j1 = dd_theta(g_tz * B_theta + g_zz * B_zeta, self.dtheta)
         j2 = dd_zeta(g_tt * B_theta + g_tz * B_zeta, self.dzeta)
-        J_rho = self.c_light * (j1 - j2) / (4.0 * np.pi * sqrtg_safe)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            J_rho = self.c_light * (j1 - j2) / (4.0 * np.pi * sqrtg)
+        if not np.all(np.isfinite(J_rho)):
+            raise FloatingPointError("Non-finite J^rho in force operator.")
 
         # G_rho
         F1 = g_tt * B_theta + g_tz * B_zeta
         F2 = g_rt * B_theta + g_rz * B_zeta
         F3 = g_tz * B_theta + g_zz * B_zeta
-        t1 = dd_rho(F1, self.rho) - dd_theta(F2, self.dtheta)
-        t2 = dd_rho(F3, self.rho) - dd_zeta(F2, self.dzeta)
-        G_rho = (B_theta * t1 + B_zeta * t2) / (4.0 * np.pi) + self.P_prime[:, None, None]
+        rho_axis = geom["rho_1d"]
+        t1 = dd_rho(F1, rho_axis) - dd_theta(F2, self.dtheta)
+        t2 = dd_rho(F3, rho_axis) - dd_zeta(F2, self.dzeta)
+        G_rho = (B_theta * t1 + B_zeta * t2) / (4.0 * np.pi) + p_prime_1d[:, None, None]
 
         # inverse-gradient components from local Jacobian inversion
         D = geom["jac"]
-        D_safe = np.where(np.abs(D) < eps, np.sign(D + eps) * eps, D)
-        rho_R = geom["Z_theta"] / D_safe
-        rho_Z = -geom["R_theta"] / D_safe
-        theta_R = -geom["Z_rho"] / D_safe
-        theta_Z = geom["R_rho"] / D_safe
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rho_R = geom["Z_theta"] / D
+            rho_Z = -geom["R_theta"] / D
+            theta_R = -geom["Z_rho"] / D
+            theta_Z = geom["R_rho"] / D
         zeta_R = np.zeros_like(theta_R)
         zeta_Z = np.zeros_like(theta_Z)
 
         # General form keeps the 1/c factor explicit.
         G_R = rho_R * G_rho + (J_rho / (TWO_PI * self.c_light)) * (
-            theta_R * self.Phi_prime[:, None, None] - zeta_R * psi_prime_1d[:, None, None]
+            theta_R * phi_prime_1d[:, None, None] - zeta_R * psi_prime_1d[:, None, None]
         )
         G_Z = rho_Z * G_rho + (J_rho / (TWO_PI * self.c_light)) * (
-            theta_Z * self.Phi_prime[:, None, None] - zeta_Z * psi_prime_1d[:, None, None]
+            theta_Z * phi_prime_1d[:, None, None] - zeta_Z * psi_prime_1d[:, None, None]
         )
+        if not (np.all(np.isfinite(G_R)) and np.all(np.isfinite(G_Z))):
+            raise FloatingPointError("Non-finite force projection encountered.")
         return J_rho, G_R, G_Z
 
     def evaluate_residuals(self, X: np.ndarray) -> np.ndarray:
-        geom = self._geometry_metrics(X)
-        _, psi_prime_1d = self._compute_psi_from_nu(geom["nu_1d"])
-        _, _, B_theta, B_zeta = self._solve_lambda_and_field(geom, psi_prime_1d)
-        J_rho, G_R, G_Z = self._force_operators(geom, B_theta, B_zeta, psi_prime_1d)
+        large_res = np.full(N_X_UNKNOWNS, 1.0e20, dtype=float)
+        try:
+            # Staggered-grid evaluation for residual assembly:
+            # magnetic closure and force balance are evaluated on half grid (rho>0).
+            geom_h = self._geometry_metrics(X, self.rho_half)
+            _, psi_prime_h = self._compute_psi_from_nu(geom_h["nu_1d"], self.rho_half)
+            _, _, B_theta_h, B_zeta_h = self._solve_lambda_and_field(
+                geom_h, psi_prime_h, self.Phi_prime_half
+            )
+            _, G_R_h, G_Z_h = self._force_operators(
+                geom_h, B_theta_h, B_zeta_h, psi_prime_h, self.Phi_prime_half, self.P_prime_half
+            )
 
-        # aliases
-        r = self.rho3
-        Theta = geom["Theta"]
-        chi1 = geom["chi1"]
-        chi2 = geom["chi2"]
-        chi3 = geom["chi3"]
-        a = self.boundary.a
-        sqrtg_w = np.abs(geom["sqrtg"])
-        vol = integrate_volume(sqrtg_w, self.rho, self.theta, self.zeta) + self.cfg.eps
+            # aliases on half-grid
+            r = geom_h["rho3"]
+            Theta = geom_h["Theta"]
+            chi1 = geom_h["chi1"]
+            chi2 = geom_h["chi2"]
+            chi3 = geom_h["chi3"]
+            a = self.boundary.a
+            sqrtg_w = np.abs(geom_h["sqrtg"])
+            vol = integrate_volume(sqrtg_w, self.rho_half, self.theta, self.zeta)
+            if (not np.isfinite(vol)) or vol <= 0.0:
+                return large_res
 
-        # 12 residual equations (s11 included)
-        R_h0 = integrate_volume(sqrtg_w * (G_R * (1.0 - r) ** 2), self.rho, self.theta, self.zeta) / vol
-        R_h1 = (
-            integrate_volume(
-                sqrtg_w * (G_R * (2.0 * r * r - 1.0) * (1.0 - r) ** 2),
-                self.rho,
-                self.theta,
-                self.zeta,
+            # 12 residual equations (s11 included)
+            R_h0 = (
+                integrate_volume(
+                    sqrtg_w * (G_R_h * (1.0 - r) ** 2),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
             )
-            / vol
-        )
-        R_c00 = (
-            integrate_volume(
-                sqrtg_w * (-G_R * r * a * np.sin(Theta) * (1.0 - r * r)),
-                self.rho,
-                self.theta,
-                self.zeta,
+            R_h1 = (
+                integrate_volume(
+                    sqrtg_w * (G_R_h * (2.0 * r * r - 1.0) * (1.0 - r) ** 2),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
             )
-            / vol
-        )
-        R_c10 = (
-            integrate_volume(
-                sqrtg_w * (-G_R * r * a * np.sin(Theta) * r * (1.0 - r * r) * np.cos(chi1)),
-                self.rho,
-                self.theta,
-                self.zeta,
+            R_c00 = (
+                integrate_volume(
+                    sqrtg_w * (-G_R_h * r * a * np.sin(Theta) * (1.0 - r * r)),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
             )
-            / vol
-        )
-        R_s10 = (
-            integrate_volume(
-                sqrtg_w * (-G_R * r * a * np.sin(Theta) * r * (1.0 - r * r) * np.sin(chi1)),
-                self.rho,
-                self.theta,
-                self.zeta,
+            R_c10 = (
+                integrate_volume(
+                    sqrtg_w * (-G_R_h * r * a * np.sin(Theta) * r * (1.0 - r * r) * np.cos(chi1)),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
             )
-            / vol
-        )
-        R_s11 = (
-            integrate_volume(
+            R_s10 = (
+                integrate_volume(
+                    sqrtg_w * (-G_R_h * r * a * np.sin(Theta) * r * (1.0 - r * r) * np.sin(chi1)),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
+            )
+            R_s11 = (
+                integrate_volume(
+                    sqrtg_w
+                    * (
+                        -G_R_h
+                        * r
+                        * a
+                        * np.sin(Theta)
+                        * r
+                        * (1.0 - r * r)
+                        * (2.0 * r * r - 1.0)
+                        * np.sin(chi1)
+                    ),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
+            )
+            R_s20 = (
+                integrate_volume(
+                    sqrtg_w * (-G_R_h * r * a * np.sin(Theta) * r * r * np.sin(chi2)),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
+            )
+            R_s30 = (
+                integrate_volume(
+                    sqrtg_w * (-G_R_h * r * a * np.sin(Theta) * r * r * (1.0 - r * r) * np.sin(chi3)),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
+            )
+            R_nu0 = (
+                integrate_volume(
+                    sqrtg_w * (G_Z_h * (1.0 - r * r)),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
+            )
+            R_nu1 = (
+                integrate_volume(
+                    sqrtg_w * (G_Z_h * (2.0 * r * r - 1.0) * (1.0 - r) ** 2),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
+            )
+            kappa_factor = (1.0 - r * r) * r * a * np.sin(chi1)
+            R_kappa0 = (
+                integrate_volume(
+                    sqrtg_w * (-G_Z_h * kappa_factor),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
+            )
+            R_kappa1 = (
+                integrate_volume(
+                    sqrtg_w * (-G_Z_h * (2.0 * r * r - 1.0) * kappa_factor),
+                    self.rho_half,
+                    self.theta,
+                    self.zeta,
+                )
+                / vol
+            )
+
+            residuals = np.array(
+                [
+                    R_h0,
+                    R_h1,
+                    R_kappa0,
+                    R_kappa1,
+                    R_nu0,
+                    R_nu1,
+                    R_c00,
+                    R_c10,
+                    R_s10,
+                    R_s11,
+                    R_s20,
+                    R_s30,
+                ],
+                dtype=float,
+            )
+            if not np.all(np.isfinite(residuals)):
+                return large_res
+            return residuals
+        except (FloatingPointError, np.linalg.LinAlgError, ValueError):
+            return large_res
+
+    def _build_jax_autodiff_jacobian(self):
+        """
+        Build automatic-differentiation Jacobian callback using JAX.
+        Residual model mirrors the staggered-grid equations and returns a dense dR/dX matrix.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        jax.config.update("jax_enable_x64", True)
+
+        rho = jnp.asarray(self.rho_half, dtype=jnp.float64)
+        theta = jnp.asarray(self.theta, dtype=jnp.float64)
+        zeta = jnp.asarray(self.zeta, dtype=jnp.float64)
+        theta2 = jnp.asarray(self.theta2, dtype=jnp.float64)
+        zeta2 = jnp.asarray(self.zeta2, dtype=jnp.float64)
+
+        dtheta = float(self.dtheta)
+        dzeta = float(self.dzeta)
+        surf_factor = float(dtheta * dzeta)
+        n_helical = float(self.cfg.n_helical)
+        Nt = float(self.cfg.N_t)
+        a = float(self.boundary.a)
+        c_light = float(self.c_light)
+        psi_a = float(self.psi_a)
+        lambda_reg = float(self.cfg.lambda_reg)
+
+        phi_prime_h = jnp.asarray(self.Phi_prime_half, dtype=jnp.float64)
+        p_prime_h = jnp.asarray(self.P_prime_half, dtype=jnp.float64)
+
+        # Boundary constants
+        R0 = float(self.boundary.R0)
+        Z0 = float(self.boundary.Z0)
+        kappa_a = float(self.boundary.kappa_a)
+        c0a = float(self.boundary.c0a)
+        c1a = float(self.boundary.c1a)
+        s1a = float(self.boundary.s1a)
+        s2a = float(self.boundary.s2a)
+        s3a = float(self.boundary.s3a)
+
+        # Lambda (m,n) spectrum basis
+        pairs = jnp.asarray(self.lambda_mode_pairs, dtype=jnp.float64)
+        m_arr = pairs[:, 0]
+        n_arr = pairs[:, 1]
+        K = int(self.lambda_mode_pairs.shape[0])
+        arg = m_arr[:, None, None] * theta2[None, :, :] - n_arr[:, None, None] * zeta2[None, :, :]
+        sin_basis = jnp.sin(arg)
+        cos_basis = jnp.cos(arg)
+        dtheta_basis = m_arr[:, None, None] * cos_basis
+        dzeta_basis = -n_arr[:, None, None] * cos_basis
+        eyeK = jnp.eye(K, dtype=jnp.float64)
+
+        # Precompute fixed trigonometric phases for geometric harmonics (n fixed by equilibrium family).
+        th3 = theta2[None, :, :]
+        ze3 = zeta2[None, :, :]
+        r3 = rho[:, None, None]
+        chi1 = th3 - n_helical * ze3
+        chi2 = 2.0 * th3 - n_helical * ze3
+        chi3 = 3.0 * th3 - n_helical * ze3
+
+        rho_size = int(self.rho_half.size)
+        if rho_size < 2:
+            raise ValueError("Need at least two half-grid points for radial derivatives.")
+        h_r = float(self.rho_half[1] - self.rho_half[0])
+
+        def dd_per(arr, spacing, axis):
+            nloc = arr.shape[axis]
+            k = 2.0 * jnp.pi * jnp.fft.fftfreq(nloc, d=spacing)
+            shape = [1] * arr.ndim
+            shape[axis] = nloc
+            ik = (1j * k).reshape(shape)
+            a_hat = jnp.fft.fft(arr, axis=axis)
+            return jnp.real(jnp.fft.ifft(ik * a_hat, axis=axis))
+
+        def dd_theta_j(arr):
+            return dd_per(arr, dtheta, axis=1)
+
+        def dd_zeta_j(arr):
+            return dd_per(arr, dzeta, axis=2)
+
+        def dd_theta2_j(arr):
+            return dd_per(arr, dtheta, axis=0)
+
+        def dd_zeta2_j(arr):
+            return dd_per(arr, dzeta, axis=1)
+
+        def dd_rho_j(arr):
+            # 4th-order finite difference on uniform half-grid.
+            n = arr.shape[0]
+            if n < 5:
+                d0 = (-3.0 * arr[0] + 4.0 * arr[1] - arr[2]) / (2.0 * h_r)
+                d1 = (arr[2] - arr[0]) / (2.0 * h_r)
+                dmid = (arr[2:] - arr[:-2]) / (2.0 * h_r)
+                dn2 = (arr[-1] - arr[-3]) / (2.0 * h_r)
+                dn1 = (3.0 * arr[-1] - 4.0 * arr[-2] + arr[-3]) / (2.0 * h_r)
+                return jnp.concatenate([d0[None, ...], d1[None, ...], dmid[1:-1], dn2[None, ...], dn1[None, ...]], axis=0)
+
+            d0 = (-25.0 * arr[0] + 48.0 * arr[1] - 36.0 * arr[2] + 16.0 * arr[3] - 3.0 * arr[4]) / (12.0 * h_r)
+            d1 = (-3.0 * arr[0] - 10.0 * arr[1] + 18.0 * arr[2] - 6.0 * arr[3] + arr[4]) / (12.0 * h_r)
+            dmid = (-arr[4:] + 8.0 * arr[3:-1] - 8.0 * arr[1:-3] + arr[:-4]) / (12.0 * h_r)
+            dn2 = (3.0 * arr[-1] + 10.0 * arr[-2] - 18.0 * arr[-3] + 6.0 * arr[-4] - arr[-5]) / (12.0 * h_r)
+            dn1 = (25.0 * arr[-1] - 48.0 * arr[-2] + 36.0 * arr[-3] - 16.0 * arr[-4] + 3.0 * arr[-5]) / (12.0 * h_r)
+            return jnp.concatenate(
+                [d0[None, ...], d1[None, ...], dmid, dn2[None, ...], dn1[None, ...]],
+                axis=0,
+            )
+
+        def integrate_volume_j(f3):
+            return jnp.trapezoid(
+                jnp.trapezoid(jnp.trapezoid(f3, zeta, axis=2), theta, axis=1),
+                rho,
+                axis=0,
+            )
+
+        def radial_profiles_j(x):
+            h0, h1, kappa0, kappa1, nu0, nu1, c00, c10, s10, s11, s20, s30 = x
+            r = rho
+            r2 = r * r
+
+            h = (h0 + h1 * (2.0 * r2 - 1.0)) * (1.0 - r) ** 2
+            u = (h0 + h1 * (2.0 * r2 - 1.0))
+            u_p = 4.0 * h1 * r
+            v = (1.0 - r) ** 2
+            v_p = -2.0 * (1.0 - r)
+            h_p = u_p * v + u * v_p
+
+            kappa = kappa_a + (1.0 - r2) * (kappa0 + kappa1 * (2.0 * r2 - 1.0))
+            A = (kappa0 + kappa1 * (2.0 * r2 - 1.0))
+            A_p = 4.0 * kappa1 * r
+            kappa_p = (-2.0 * r) * A + (1.0 - r2) * A_p
+
+            nu = (1.0 - r2) * (nu0 + nu1 * (2.0 * r2 - 1.0))
+            B = (nu0 + nu1 * (2.0 * r2 - 1.0))
+            B_p = 4.0 * nu1 * r
+            nu_p = (-2.0 * r) * B + (1.0 - r2) * B_p
+
+            c0 = c0a + c00 * (1.0 - r2)
+            c0_p = -2.0 * c00 * r
+
+            c1 = r * (c1a + c10 * (1.0 - r2))
+            c1_p = c1a + c10 * (1.0 - 3.0 * r2)
+
+            A = (1.0 - r2)
+            B = (s10 + s11 * (2.0 * r2 - 1.0))
+            C = s1a + A * B
+            C_p = (-2.0 * r) * B + A * (4.0 * s11 * r)
+            s1 = r * C
+            s1_p = C + r * C_p
+
+            s2 = r2 * (s2a + s20 * (1.0 - r2))
+            s2_p = 2.0 * r * (s2a + s20 * (1.0 - 2.0 * r2))
+
+            s3 = r2 * (s3a + s30 * (1.0 - r2))
+            s3_p = 2.0 * r * (s3a + s30 * (1.0 - 2.0 * r2))
+
+            return h, h_p, kappa, kappa_p, nu, nu_p, c0, c0_p, c1, c1_p, s1, s1_p, s2, s2_p, s3, s3_p
+
+        def geometry_j(x):
+            h, h_p, kappa, kappa_p, nu, nu_p, c0, c0_p, c1, c1_p, s1, s1_p, s2, s2_p, s3, s3_p = radial_profiles_j(x)
+
+            h3 = h[:, None, None]
+            h_p3 = h_p[:, None, None]
+            kappa3 = kappa[:, None, None]
+            kappa_p3 = kappa_p[:, None, None]
+            nu3 = nu[:, None, None]
+            nu_p3 = nu_p[:, None, None]
+            c0_3 = c0[:, None, None]
+            c0_p3 = c0_p[:, None, None]
+            c1_3 = c1[:, None, None]
+            c1_p3 = c1_p[:, None, None]
+            s1_3 = s1[:, None, None]
+            s1_p3 = s1_p[:, None, None]
+            s2_3 = s2[:, None, None]
+            s2_p3 = s2_p[:, None, None]
+            s3_3 = s3[:, None, None]
+            s3_p3 = s3_p[:, None, None]
+
+            Theta = chi1 + c0_3 + c1_3 * jnp.cos(chi1) + s1_3 * jnp.sin(chi1) + s2_3 * jnp.sin(chi2) + s3_3 * jnp.sin(chi3)
+            Theta_theta = 1.0 - c1_3 * jnp.sin(chi1) + s1_3 * jnp.cos(chi1) + 2.0 * s2_3 * jnp.cos(chi2) + 3.0 * s3_3 * jnp.cos(chi3)
+            Theta_zeta = -n_helical + n_helical * c1_3 * jnp.sin(chi1) - n_helical * s1_3 * jnp.cos(chi1) - n_helical * s2_3 * jnp.cos(chi2) - n_helical * s3_3 * jnp.cos(chi3)
+            Theta_rho = c0_p3 + c1_p3 * jnp.cos(chi1) + s1_p3 * jnp.sin(chi1) + s2_p3 * jnp.sin(chi2) + s3_p3 * jnp.sin(chi3)
+
+            R = R0 + h3 + r3 * a * jnp.cos(Theta)
+            Z = Z0 + nu3 - kappa3 * r3 * a * jnp.sin(chi1)
+
+            R_rho = h_p3 + a * jnp.cos(Theta) - r3 * a * jnp.sin(Theta) * Theta_rho
+            R_theta = -r3 * a * jnp.sin(Theta) * Theta_theta
+            R_zeta = -r3 * a * jnp.sin(Theta) * Theta_zeta
+
+            Z_rho = nu_p3 - (kappa_p3 * r3 * a + kappa3 * a) * jnp.sin(chi1)
+            Z_theta = -kappa3 * r3 * a * jnp.cos(chi1)
+            Z_zeta = n_helical * kappa3 * r3 * a * jnp.cos(chi1)
+
+            jac = R_rho * Z_theta - R_theta * Z_rho
+            sqrtg = (R / Nt) * jac
+
+            g_tt = R_theta * R_theta + Z_theta * Z_theta
+            g_zz = R_zeta * R_zeta + Z_zeta * Z_zeta + (R * R) / (Nt * Nt)
+            g_rt = R_rho * R_theta + Z_rho * Z_theta
+            g_rz = R_rho * R_zeta + Z_rho * Z_zeta
+            g_tz = R_theta * R_zeta + Z_theta * Z_zeta
+
+            return {
+                "rho3": r3 + jnp.zeros_like(R),
+                "R": R,
+                "Z": Z,
+                "Theta": Theta,
+                "chi1": chi1,
+                "chi2": chi2,
+                "chi3": chi3,
+                "R_rho": R_rho,
+                "R_theta": R_theta,
+                "Z_rho": Z_rho,
+                "Z_theta": Z_theta,
+                "jac": jac,
+                "sqrtg": sqrtg,
+                "g_tt": g_tt,
+                "g_zz": g_zz,
+                "g_rt": g_rt,
+                "g_rz": g_rz,
+                "g_tz": g_tz,
+                "nu_1d": nu,
+            }
+
+        def compute_psi_j(nu_1d):
+            psi = psi_a * (rho * rho) * (1.0 + nu_1d)
+            psi_prime = dd_rho_j(psi)
+            return psi, psi_prime
+
+        def solve_lambda_and_field_j(geom, psi_prime_1d):
+            sqrtg = geom["sqrtg"]
+            g_tt = geom["g_tt"]
+            g_tz = geom["g_tz"]
+            g_zz = geom["g_zz"]
+            n_rho = int(sqrtg.shape[0])
+            lam_all = []
+
+            for i in range(n_rho):
+                sqrtg_i = sqrtg[i]
+
+                def jrho_2d(lam_theta, lam_zeta):
+                    B_theta = (psi_prime_1d[i] - lam_zeta) / (TWO_PI * sqrtg_i)
+                    B_zeta = (phi_prime_h[i] + lam_theta) / (TWO_PI * sqrtg_i)
+                    t1 = dd_theta2_j(g_tz[i] * B_theta + g_zz[i] * B_zeta)
+                    t2 = dd_zeta2_j(g_tt[i] * B_theta + g_tz[i] * B_zeta)
+                    return (t1 - t2) / (4.0 * jnp.pi * sqrtg_i)
+
+                J0 = jrho_2d(jnp.zeros_like(sqrtg_i), jnp.zeros_like(sqrtg_i))
+                ws = sqrtg_i[None, :, :] * sin_basis
+                b = -surf_factor * jnp.einsum("qij,ij->q", ws, J0, optimize=True)
+
+                dB_theta_basis = -dzeta_basis / (TWO_PI * sqrtg_i[None, :, :])
+                dB_zeta_basis = dtheta_basis / (TWO_PI * sqrtg_i[None, :, :])
+                t1_basis = dd_theta_j(g_tz[i][None, :, :] * dB_theta_basis + g_zz[i][None, :, :] * dB_zeta_basis)
+                t2_basis = dd_zeta_j(g_tt[i][None, :, :] * dB_theta_basis + g_tz[i][None, :, :] * dB_zeta_basis)
+                dJ_basis = (t1_basis - t2_basis) / (4.0 * jnp.pi * sqrtg_i[None, :, :])
+
+                A = surf_factor * jnp.einsum("qij,pij->qp", ws, dJ_basis, optimize=True)
+                lam_i = jnp.linalg.solve(A + lambda_reg * eyeK, b)
+                lam_all.append(lam_i)
+
+            lam_coeff = jnp.stack(lam_all, axis=0)
+            lam_theta_3 = jnp.tensordot(lam_coeff, dtheta_basis, axes=(1, 0))
+            lam_zeta_3 = jnp.tensordot(lam_coeff, dzeta_basis, axes=(1, 0))
+            B_theta = (psi_prime_1d[:, None, None] - lam_zeta_3) / (TWO_PI * sqrtg)
+            B_zeta = (phi_prime_h[:, None, None] + lam_theta_3) / (TWO_PI * sqrtg)
+            return lam_coeff, B_theta, B_zeta
+
+        def force_operators_j(geom, B_theta, B_zeta, psi_prime_1d):
+            sqrtg = geom["sqrtg"]
+            g_tt = geom["g_tt"]
+            g_tz = geom["g_tz"]
+            g_zz = geom["g_zz"]
+            g_rt = geom["g_rt"]
+            g_rz = geom["g_rz"]
+
+            j1 = dd_theta_j(g_tz * B_theta + g_zz * B_zeta)
+            j2 = dd_zeta_j(g_tt * B_theta + g_tz * B_zeta)
+            J_rho = c_light * (j1 - j2) / (4.0 * jnp.pi * sqrtg)
+
+            F1 = g_tt * B_theta + g_tz * B_zeta
+            F2 = g_rt * B_theta + g_rz * B_zeta
+            F3 = g_tz * B_theta + g_zz * B_zeta
+            t1 = dd_rho_j(F1) - dd_theta_j(F2)
+            t2 = dd_rho_j(F3) - dd_zeta_j(F2)
+            G_rho = (B_theta * t1 + B_zeta * t2) / (4.0 * jnp.pi) + p_prime_h[:, None, None]
+
+            D = geom["jac"]
+            rho_R = geom["Z_theta"] / D
+            rho_Z = -geom["R_theta"] / D
+            theta_R = -geom["Z_rho"] / D
+            theta_Z = geom["R_rho"] / D
+
+            G_R = rho_R * G_rho + (J_rho / (TWO_PI * c_light)) * (theta_R * phi_prime_h[:, None, None])
+            G_Z = rho_Z * G_rho + (J_rho / (TWO_PI * c_light)) * (theta_Z * phi_prime_h[:, None, None])
+            return J_rho, G_R, G_Z
+
+        def residual_jax(x):
+            geom = geometry_j(x)
+            _, psi_prime_1d = compute_psi_j(geom["nu_1d"])
+            _, B_theta, B_zeta = solve_lambda_and_field_j(geom, psi_prime_1d)
+            _, G_R, G_Z = force_operators_j(geom, B_theta, B_zeta, psi_prime_1d)
+
+            r = geom["rho3"]
+            Theta = geom["Theta"]
+            chi1_l = geom["chi1"]
+            chi2_l = geom["chi2"]
+            chi3_l = geom["chi3"]
+            sqrtg_w = jnp.abs(geom["sqrtg"])
+            vol = integrate_volume_j(sqrtg_w)
+
+            R_h0 = integrate_volume_j(sqrtg_w * (G_R * (1.0 - r) ** 2)) / vol
+            R_h1 = integrate_volume_j(sqrtg_w * (G_R * (2.0 * r * r - 1.0) * (1.0 - r) ** 2)) / vol
+            R_c00 = integrate_volume_j(sqrtg_w * (-G_R * r * a * jnp.sin(Theta) * (1.0 - r * r))) / vol
+            R_c10 = integrate_volume_j(
+                sqrtg_w * (-G_R * r * a * jnp.sin(Theta) * r * (1.0 - r * r) * jnp.cos(chi1_l))
+            ) / vol
+            R_s10 = integrate_volume_j(
+                sqrtg_w * (-G_R * r * a * jnp.sin(Theta) * r * (1.0 - r * r) * jnp.sin(chi1_l))
+            ) / vol
+            R_s11 = integrate_volume_j(
                 sqrtg_w
-                * (-G_R * r * a * np.sin(Theta) * r * (1.0 - r * r) * (2.0 * r * r - 1.0) * np.sin(chi1)),
-                self.rho,
-                self.theta,
-                self.zeta,
-            )
-            / vol
-        )
-        R_s20 = (
-            integrate_volume(
-                sqrtg_w * (-G_R * r * a * np.sin(Theta) * r * r * np.sin(chi2)),
-                self.rho,
-                self.theta,
-                self.zeta,
-            )
-            / vol
-        )
-        R_s30 = (
-            integrate_volume(
-                sqrtg_w * (-G_R * r * a * np.sin(Theta) * r * r * (1.0 - r * r) * np.sin(chi3)),
-                self.rho,
-                self.theta,
-                self.zeta,
-            )
-            / vol
-        )
-        R_nu0 = (
-            integrate_volume(
-                sqrtg_w * (G_Z * (1.0 - r * r)),
-                self.rho,
-                self.theta,
-                self.zeta,
-            )
-            / vol
-        )
-        R_nu1 = (
-            integrate_volume(
-                sqrtg_w * (G_Z * (2.0 * r * r - 1.0) * (1.0 - r) ** 2),
-                self.rho,
-                self.theta,
-                self.zeta,
-            )
-            / vol
-        )
-        kappa_factor = (1.0 - r * r) * r * a * np.sin(chi1)
-        R_kappa0 = (
-            integrate_volume(
-                sqrtg_w * (-G_Z * kappa_factor),
-                self.rho,
-                self.theta,
-                self.zeta,
-            )
-            / vol
-        )
-        R_kappa1 = (
-            integrate_volume(
-                sqrtg_w * (-G_Z * (2.0 * r * r - 1.0) * kappa_factor),
-                self.rho,
-                self.theta,
-                self.zeta,
-            )
-            / vol
-        )
+                * (
+                    -G_R
+                    * r
+                    * a
+                    * jnp.sin(Theta)
+                    * r
+                    * (1.0 - r * r)
+                    * (2.0 * r * r - 1.0)
+                    * jnp.sin(chi1_l)
+                )
+            ) / vol
+            R_s20 = integrate_volume_j(sqrtg_w * (-G_R * r * a * jnp.sin(Theta) * r * r * jnp.sin(chi2_l))) / vol
+            R_s30 = integrate_volume_j(
+                sqrtg_w * (-G_R * r * a * jnp.sin(Theta) * r * r * (1.0 - r * r) * jnp.sin(chi3_l))
+            ) / vol
+            R_nu0 = integrate_volume_j(sqrtg_w * (G_Z * (1.0 - r * r))) / vol
+            R_nu1 = integrate_volume_j(sqrtg_w * (G_Z * (2.0 * r * r - 1.0) * (1.0 - r) ** 2)) / vol
+            kappa_factor = (1.0 - r * r) * r * a * jnp.sin(chi1_l)
+            R_kappa0 = integrate_volume_j(sqrtg_w * (-G_Z * kappa_factor)) / vol
+            R_kappa1 = integrate_volume_j(sqrtg_w * (-G_Z * (2.0 * r * r - 1.0) * kappa_factor)) / vol
 
-        # X ordering:
-        # [h0, h1, kappa0, kappa1, nu0, nu1, c00, c10, s10, s11, s20, s30]
-        residuals = np.array(
-            [
-                R_h0,
-                R_h1,
-                R_kappa0,
-                R_kappa1,
-                R_nu0,
-                R_nu1,
-                R_c00,
-                R_c10,
-                R_s10,
-                R_s11,
-                R_s20,
-                R_s30,
-            ],
-            dtype=float,
-        )
-        return residuals
+            res = jnp.array(
+                [
+                    R_h0,
+                    R_h1,
+                    R_kappa0,
+                    R_kappa1,
+                    R_nu0,
+                    R_nu1,
+                    R_c00,
+                    R_c10,
+                    R_s10,
+                    R_s11,
+                    R_s20,
+                    R_s30,
+                ],
+                dtype=jnp.float64,
+            )
+            return jnp.nan_to_num(res, nan=1.0e20, posinf=1.0e20, neginf=-1.0e20)
+
+        jac_jax = jax.jacfwd(residual_jax)
+
+        def jac_np(x: np.ndarray) -> np.ndarray:
+            xj = jnp.asarray(x, dtype=jnp.float64)
+            return np.asarray(jac_jax(xj), dtype=float)
+
+        return jac_np
 
     def solve(self, x0: np.ndarray) -> least_squares:
+        jac_for_solver = "2-point"
+        if self.jacobian_mode == "jax_ad":
+            try:
+                jac_for_solver = self._build_jax_autodiff_jacobian()
+            except Exception as exc:
+                print(f"[warn] JAX Jacobian unavailable, fallback to scipy_fd: {exc}")
+                jac_for_solver = "2-point"
+
         def fun(x: np.ndarray) -> np.ndarray:
             r = self.evaluate_residuals(x)
             print(f"res_inf={np.max(np.abs(r)):.6e}")
@@ -994,6 +1475,7 @@ class V3DEquilibriumSolver:
         return least_squares(
             fun,
             x0,
+            jac=jac_for_solver,
             method="trf",
             xtol=self.cfg.tol,
             ftol=self.cfg.tol,
@@ -1005,9 +1487,11 @@ class V3DEquilibriumSolver:
     def postprocess(self, X: np.ndarray, output_dir: Path) -> Dict[str, object]:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        geom = self._geometry_metrics(X)
-        psi_1d, psi_prime_1d = self._compute_psi_from_nu(geom["nu_1d"])
-        lam_coeff, _, _, _ = self._solve_lambda_and_field(geom, psi_prime_1d)
+        geom = self._geometry_metrics(X, self.rho)
+        geom_h = self._geometry_metrics(X, self.rho_half)
+        psi_1d, psi_prime_1d = self._compute_psi_from_nu(geom["nu_1d"], self.rho)
+        _, psi_prime_h = self._compute_psi_from_nu(geom_h["nu_1d"], self.rho_half)
+        lam_coeff, _, _, _ = self._solve_lambda_and_field(geom_h, psi_prime_h, self.Phi_prime_half)
         psi3 = psi_1d[:, None, None] * np.ones_like(geom["R"])
         psi_prime_mismatch = psi_prime_1d - self.Psi_prime_iota
 
@@ -1096,6 +1580,17 @@ class V3DEquilibriumSolver:
             "phi_total": self.cfg.phi_total,
             "c_light": self.c_light,
             "psi_a": self.psi_a,
+            "staggered_grid": {
+                "rho_full_size": int(self.rho.size),
+                "rho_half_size": int(self.rho_half.size),
+                "geometry_on": "full_grid",
+                "P_PhiPrime_PsiPrime_B_on": "half_grid",
+            },
+            "derivative_methods": {
+                "theta": "fft_pseudo_spectral",
+                "zeta": "fft_pseudo_spectral",
+                "rho": "4th_order_fd_uniform_else_cubic_spline",
+            },
             "lambda_mode_count": int(self.lambda_mode_pairs.shape[0]),
             "lambda_mode_pairs": self.lambda_mode_pairs.tolist(),
             "inputs": {
@@ -1113,6 +1608,7 @@ class V3DEquilibriumSolver:
                 },
                 "lambda_fourier": dict(self.case_cfg.get("lambda_fourier", {})),
                 "physical_constants": dict(self.case_cfg.get("physical_constants", {})),
+                "solver": {"jacobian_mode": self.jacobian_mode},
                 "initial_guess": self.initial_guess.tolist(),
             },
             "boundary": self.boundary.__dict__,
@@ -1145,6 +1641,7 @@ class V3DEquilibriumSolver:
         np.savez_compressed(
             output_dir / "equilibrium_fields.npz",
             rho=self.rho,
+            rho_half=self.rho_half,
             theta=self.theta,
             zeta=self.zeta,
             R=geom["R"],
@@ -1177,6 +1674,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tol", type=float, default=None)
     p.add_argument("--max-nfev", type=int, default=None)
     p.add_argument("--lambda-reg", type=float, default=None)
+    p.add_argument(
+        "--jacobian-mode",
+        type=str,
+        choices=["jax_ad", "scipy_fd"],
+        default=None,
+        help="Jacobian mode for least_squares.",
+    )
     p.add_argument("--lambda-m-min", type=int, default=None)
     p.add_argument("--lambda-m-max", type=int, default=None)
     p.add_argument("--lambda-n-min", type=int, default=None)
@@ -1260,6 +1764,8 @@ def main() -> None:
     if args.lambda_n_max is not None:
         case_cfg["lambda_fourier"]["n_max"] = int(args.lambda_n_max)
     case_cfg.setdefault("solver", {})
+    if args.jacobian_mode is not None:
+        case_cfg["solver"]["jacobian_mode"] = str(args.jacobian_mode)
     if args.s11 is not None:
         x0_case = list(case_cfg["solver"].get("initial_guess", [0.0] * N_X_UNKNOWNS))
         if len(x0_case) == N_X_UNKNOWNS - 1:
