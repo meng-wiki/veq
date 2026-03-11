@@ -17,7 +17,6 @@ class VEQ3D_Solver:
         self.Nz_grid = 16             
         
         rho_nodes, self.rho_weights = roots_legendre(self.Nr)
-        # 映射到 [0, 1] 区间
         self.rho = 0.5 * (rho_nodes + 1)
         self.rho_weights *= 0.5
         
@@ -36,21 +35,19 @@ class VEQ3D_Solver:
         self.fit_boundary()
         
         # 自适应预条件权重
-        self.res_scales = np.ones(22) # 21物理 + 1惩罚
+        self.res_scales = np.ones(21)
         self._initialize_scaling()
 
     def _get_legendre_diff_matrix(self, x):
         """计算非均匀节点下的高精度谱微分矩阵"""
         n = len(x)
         D = np.zeros((n, n))
-        # 计算重心权重
         w = np.ones(n)
         for i in range(n):
             for j in range(n):
                 if i != j:
                     w[i] *= (x[i] - x[j])
         w = 1.0 / w
-        # 构造矩阵
         for i in range(n):
             for j in range(n):
                 if i != j:
@@ -62,11 +59,11 @@ class VEQ3D_Solver:
         print(">>> 正在执行物理量纲归一化预条件...")
         x0 = np.zeros(21); x0[15] = 0.05
         raw_res = self.compute_physics(x0, apply_scaling=False)
-        self.res_scales = np.maximum(np.abs(raw_res), 1e-2)
+        self.res_scales = np.maximum(np.abs(raw_res), 1e-3)
 
     def get_profiles(self, rho):
         """无量纲化剖面: P已相对于 B0^2/mu_0 归一化"""
-        beta_0 = 0.02 # 假设中心 beta 约为 2%
+        beta_0 = 0.02 
         P = beta_0 * (rho**2 - 1)**2
         dP_drho = beta_0 * 4 * rho * (rho**2 - 1)
         Phi_prime = 2 * rho * self.Phi_a
@@ -102,15 +99,14 @@ class VEQ3D_Solver:
 
     def compute_geometry(self, x_core, rho, theta, zeta):
         fac = 1.0 - rho**2
-        # Lambda 的包络采用 rho^2 以消除磁轴奇异性
-        L_fac = rho**2 * fac
+        L_fac = rho**2 * fac # 消除磁轴奇异性
         
         c0R = (self.X_edge['c00'] + x_core[0]*fac) + (self.X_edge['c01c'] + x_core[1]*fac)*np.cos(zeta) + (self.X_edge['c01s'] + x_core[2]*fac)*np.sin(zeta)
         c0Z = (self.X_edge['c00z'] + x_core[3]*fac) + (self.X_edge['c01cz'] + x_core[4]*fac)*np.cos(zeta) + (self.X_edge['c01sz'] + x_core[5]*fac)*np.sin(zeta)
         h = (self.X_edge['h0'] + x_core[6]*fac) + (self.X_edge['h1c'] + x_core[7]*fac)*np.cos(zeta) + (self.X_edge['h1s'] + x_core[8]*fac)*np.sin(zeta)
         v = (self.X_edge['v0'] + x_core[9]*fac) + (self.X_edge['v1c'] + x_core[10]*fac)*np.cos(zeta) + (self.X_edge['v1s'] + x_core[11]*fac)*np.sin(zeta)
-        a = (self.X_edge['a0'] + x_core[15]*fac) + (self.X_edge['a1c'] + x_core[16]*fac)*np.cos(zeta) + (self.X_edge['a1s'] + x_core[17]*fac)*np.sin(zeta)
         k = (self.X_edge['k0'] + x_core[12]*fac) + (self.X_edge['k1c'] + x_core[13]*fac)*np.cos(zeta) + (self.X_edge['k1s'] + x_core[14]*fac)*np.sin(zeta)
+        a = (self.X_edge['a0'] + x_core[15]*fac) + (self.X_edge['a1c'] + x_core[16]*fac)*np.cos(zeta) + (self.X_edge['a1s'] + x_core[17]*fac)*np.sin(zeta)
         
         R = self.X_edge['R0'] + h + rho * a * np.cos(theta + c0R)
         Z = self.X_edge['Z0'] + v + k * rho * a * np.sin(theta + c0Z)
@@ -118,16 +114,16 @@ class VEQ3D_Solver:
         return R, Z, theta+c0R, theta+c0Z, a, k, Lambda
 
     def compute_physics(self, x_core, apply_scaling=True):
-        """核心物理计算：谱微分矩阵 + 真实雅可比 + 几何惩罚"""
+        """物理核心计算：补全 3D 度规 + 修正电流雅可比 + 严格变分核"""
         rho, theta, zeta = self.RHO, self.TH, self.ZE
         fac, dfac = 1.0 - rho**2, -2.0 * rho
         L_fac = rho**2 * fac
+        cz, sz = np.cos(zeta), np.sin(zeta)
         
         def periodic_grad(f, step, axis):
             return (np.roll(f, -1, axis=axis) - np.roll(f, 1, axis=axis)) / (2 * step)
 
-        # 1. 解析重构几何导数
-        cz, sz = np.cos(zeta), np.sin(zeta)
+        # 1. 解析重构几何导数 (补充环向项 Rz, Zz)
         def eval_derivs(edge, core, cz, sz):
             val = (edge[0]+core[0]*fac) + (edge[1]+core[1]*fac)*cz + (edge[2]+core[2]*fac)*sz
             dr = core[0]*dfac + core[1]*dfac*cz + core[2]*dfac*sz
@@ -136,132 +132,131 @@ class VEQ3D_Solver:
 
         h, hr, hz = eval_derivs([self.X_edge['h0'], self.X_edge['h1c'], self.X_edge['h1s']], x_core[6:9], cz, sz)
         v, vr, vz = eval_derivs([self.X_edge['v0'], self.X_edge['v1c'], self.X_edge['v1s']], x_core[9:12], cz, sz)
-        a, ar, az = eval_derivs([self.X_edge['a0'], self.X_edge['a1c'], self.X_edge['a1s']], x_core[15:18], cz, sz)
         k, kr, kz = eval_derivs([self.X_edge['k0'], self.X_edge['k1c'], self.X_edge['k1s']], x_core[12:15], cz, sz)
+        a, ar, az = eval_derivs([self.X_edge['a0'], self.X_edge['a1c'], self.X_edge['a1s']], x_core[15:18], cz, sz)
         c0R, c0Rr, c0Rz = eval_derivs([self.X_edge['c00'], self.X_edge['c01c'], self.X_edge['c01s']], x_core[0:3], cz, sz)
         c0Z, c0Zr, c0Zz = eval_derivs([self.X_edge['c00z'], self.X_edge['c01cz'], self.X_edge['c01sz']], x_core[3:6], cz, sz)
 
         thR, thZ = theta + c0R, theta + c0Z
         R = self.X_edge['R0'] + h + rho * a * np.cos(thR)
+        Z = self.X_edge['Z0'] + v + k * rho * a * np.sin(thZ)
+        
         Rr = hr + a*np.cos(thR) + rho*ar*np.cos(thR) - rho*a*np.sin(thR)*c0Rr
         Rt = -rho*a*np.sin(thR)
+        Rz = hz + rho*az*np.cos(thR) - rho*a*np.sin(thR)*c0Rz
+        
         Zr = vr + kr*rho*a*np.sin(thZ) + k*a*np.sin(thZ) + k*rho*ar*np.sin(thZ) + k*rho*a*np.cos(thZ)*c0Zr
         Zt = k*rho*a*np.cos(thZ)
+        Zz = vz + kz*rho*a*np.sin(thZ) + k*rho*az*np.sin(thZ) + k*rho*a*np.cos(thZ)*c0Zz
 
-        # 2. 真实度规计算
-        det_J = Rr * Zt - Rt * Zr
-        det_phys = np.sign(det_J) * np.maximum(np.abs(det_J), 1e-8)
-        sqrt_g = (R / self.Nt) * det_phys
-        
-        # 3. 磁场计算
+        # 2. 补全三维度规张量 (Section 3.1)
+        det_phys = Rr * Zt - Rt * Zr
+        det_safe = np.sign(det_phys) * np.maximum(np.abs(det_phys), 1e-8)
+        sqrt_g = (R / self.Nt) * det_safe
+
+        g_rr = Rr**2 + Zr**2
+        g_tt = Rt**2 + Zt**2
+        g_zz = Rz**2 + (R/self.Nt)**2 + Zz**2 # 补全环向项
+        g_rt = Rr*Rt + Zr*Zt
+        g_rz = Rr*Rz + Zr*Zz # 补全交叉项
+        g_tz = Rt*Rz + Zt*Zz # 补全交叉项
+
+        # 3. 磁场计算 (协变分量 B_i = g_ij * B^j)
         L1n1, L10, L11 = x_core[18:21]
-        Lambda = L_fac * (L1n1 * np.sin(theta + zeta) + L10 * np.sin(theta) + L11 * np.sin(theta - zeta))
-        Lt = L_fac * (L1n1 * np.cos(theta + zeta) + L10 * np.cos(theta) + L11 * np.cos(theta - zeta))
+        Lt = L_fac * (L1n1 * np.cos(thR) + L10 * np.cos(theta) + L11 * np.cos(thZ)) # 近似导数
         Lz = L_fac * (L1n1 * np.cos(theta + zeta) - L11 * np.cos(theta - zeta))
-
+        
         P, dP, psip, Phip = self.get_profiles(rho)
         Bt_sup = (psip - Lz) / (2 * np.pi * sqrt_g)
         Bz_sup = (Phip + Lt) / (2 * np.pi * sqrt_g)
 
-        g_tt, g_rt = Rt**2 + Zt**2, Rr*Rt+Zr*Zt
-        g_zz = (R/self.Nt)**2
-        Bt_sub, Bz_sub, Br_sub = g_tt * Bt_sup, g_zz * Bz_sup, g_rt * Bt_sup
+        Br_sub = g_rt * Bt_sup + g_rz * Bz_sup
+        Bt_sub = g_tt * Bt_sup + g_tz * Bz_sup
+        Bz_sub = g_tz * Bt_sup + g_zz * Bz_sup
 
-        # --- 谱微分矩阵 D 计算径向导数 ---
+        # --- 核心改进：电流密度除以完整的 sqrt_g ---
         dBt_drho = np.tensordot(self.D_matrix, Bt_sub, axes=(1, 0))
         dBz_drho = np.tensordot(self.D_matrix, Bz_sub, axes=(1, 0))
 
-        Jz_sup = (dBt_drho - periodic_grad(Br_sub, self.dtheta, axis=1)) / det_phys
-        Jt_sup = (periodic_grad(Br_sub, self.dzeta, axis=2) - dBz_drho) / det_phys
-        Jr_sup = (periodic_grad(Bz_sub, self.dtheta, axis=1) - periodic_grad(Bt_sub, self.dzeta, axis=2)) / det_phys
+        Jz_sup = (dBt_drho - periodic_grad(Br_sub, self.dtheta, axis=1)) / sqrt_g
+        Jt_sup = (periodic_grad(Br_sub, self.dzeta, axis=2) - dBz_drho) / sqrt_g
+        Jr_sup = (periodic_grad(Bz_sub, self.dtheta, axis=1) - periodic_grad(Bt_sub, self.dzeta, axis=2)) / sqrt_g
 
-        # 4. 平衡算子 (无量纲单位)
+        # 4. 平衡算子与物理投影
         G_rho = dP - sqrt_g * (Jt_sup * Bz_sup - Jz_sup * Bt_sup)
-        rho_R, rho_Z = Zt/det_phys, -Rt/det_phys
-        GR = (rho_R * G_rho + (Jr_sup / (2 * np.pi)) * (-Zr/det_phys * Phip))
-        GZ = (rho_Z * G_rho + (Jr_sup / (2 * np.pi)) * (Rr/det_phys * Phip))
+        rho_R, rho_Z = Zt/det_safe, -Rt/det_safe
+        th_R, th_Z = -Zr/det_safe, Rr/det_safe
+        GR = (rho_R * G_rho + (Jr_sup / (2 * np.pi)) * (th_R * Phip))
+        GZ = (rho_Z * G_rho + (Jr_sup / (2 * np.pi)) * (th_Z * Phip))
 
-        # 5. 残差构造
+        # 5. 变分残差构造 (严格对齐参数偏导数)
         residuals = []
+        # --- 核心改进：补全 k 和 a 系列的 fac 因子 ---
         kernels = [
-            -fac * rho * a * np.sin(thR), -fac * rho * a * np.sin(thR) * cz, -fac * rho * a * np.sin(thR) * sz, 
-            fac * k * rho * a * np.cos(thZ), fac * k * rho * a * np.cos(thZ) * cz, fac * k * rho * a * np.cos(thZ) * sz, 
-            fac, fac * cz, fac * sz, fac, fac * cz, fac * sz, 
-            rho * a * np.sin(thZ), rho * a * np.sin(thZ) * cz, rho * a * np.sin(thZ) * sz, 
-            rho * np.cos(thR), rho * np.cos(thR) * cz, rho * np.cos(thR) * sz
+            -fac * rho * a * np.sin(thR), -fac * rho * a * np.sin(thR) * cz, -fac * rho * a * np.sin(thR) * sz, # c0R
+            fac * k * rho * a * np.cos(thZ), fac * k * rho * a * np.cos(thZ) * cz, fac * k * rho * a * np.cos(thZ) * sz, # c0Z
+            fac, fac * cz, fac * sz, # h
+            fac, fac * cz, fac * sz, # v
+            fac * rho * a * np.sin(thZ), fac * rho * a * np.sin(thZ) * cz, fac * rho * a * np.sin(thZ) * sz, # k (修正)
+            fac * rho * np.cos(thR), fac * rho * np.cos(thR) * cz, fac * rho * np.cos(thR) * sz # a (修正)
         ]
         
         dV = self.dtheta * self.dzeta
         for i in range(18):
-            term = GR * kernels[i] if (i<3 or (6<=i<9) or i>=15) else GZ * kernels[i]
+            if i < 3 or (6 <= i < 9): # c0R, h -> R 方向
+                term = GR * kernels[i]
+            elif (3 <= i < 6) or (9 <= i < 15): # c0Z, v, kappa -> Z 方向
+                term = GZ * kernels[i]
+            else: # a (15, 16, 17) -> --- 核心改进：双向投影 ---
+                kernel_R = kernels[i]
+                kernel_Z = fac * k * rho * np.sin(thZ) * (1 if i==15 else (cz if i==16 else sz))
+                term = GR * kernel_R + GZ * kernel_Z
+            
             residuals.append(np.sum(sqrt_g * term * self.weights_3d) * dV)
 
+        # 流函数代数方程 J^rho = 0
         for m, n in [(1, -1), (1, 0), (1, 1)]:
             res_L = np.sum(sqrt_g * Jr_sup * np.sin(m * self.TH + n * self.ZE) * self.weights_3d) * dV
             residuals.append(res_L)
             
         final_res = np.array(residuals)
-        
-        # 几何约束作为惩罚项
-        if np.any(det_J <= 0):
-            violation = np.sum(np.where(det_J <= 1e-4, (1e-4 - det_J)**2, 0))
-            final_res *= 1.0 + 10.0 * violation 
-            
         if apply_scaling:
             return final_res / self.res_scales
         return final_res
 
     def solve(self):
-        print(">>> 启动 VEQ-3D 谱精度物理求解器 (谱导数矩阵 + 奇异性抑制)...")
+        print(">>> 启动 VEQ-3D 物理完备性求解器 (3D度规、雅可比修正、双投影核)...")
         x0 = np.zeros(21); x0[15] = 0.05
-        res = least_squares(self.compute_physics, x0, method='trf', xtol=1e-8, ftol=1e-8, max_nfev=500)
+        res = least_squares(self.compute_physics, x0, method='trf', xtol=1e-10, ftol=1e-10, max_nfev=500)
         print(f">>> 最终残差范数: {np.linalg.norm(res.fun):.4e}")
         self.plot_equilibrium(res.x)
         return res.x
 
     def plot_equilibrium(self, x_core):
-        """可视化输出，包含对应的输入 LCFS 目标曲线"""
         zetas = [0, np.pi/3, 2*np.pi/3, np.pi, 4*np.pi/3, 5*np.pi/3]
         fig, axes = plt.subplots(2, 3, figsize=(15, 12))
         axes = axes.flatten()
-        
-        # 绘图网格
         rp = np.linspace(0, 1, 50); tp = np.linspace(0, 2*np.pi, 100)
         R_P, T_P = np.meshgrid(rp, tp); PSI_P = self.compute_psi(R_P)
-        
         for i, zv in enumerate(zetas):
-            ax = axes[i]
-            # 计算计算得到的磁面
-            Rm, Zm = [], []
+            ax = axes[i]; Rm, Zm = [], []
             for r, t in zip(R_P.flatten(), T_P.flatten()):
                 res_g = self.compute_geometry(x_core, r, t, zv)
                 Rm.append(res_g[0]); Zm.append(res_g[1])
             Rm = np.array(Rm).reshape(R_P.shape); Zm = np.array(Zm).reshape(R_P.shape)
-            
-            # 画出磁通分布图
-            im = ax.tripcolor(Rm.flatten(), Zm.flatten(), PSI_P.flatten(), shading='gouraud', cmap='magma', alpha=0.9)
-            
-            # 画出计算得到的磁面等高线 (rho = 0.2, 0.4, 0.6, 0.8, 1.0)
+            ax.tripcolor(Rm.flatten(), Zm.flatten(), PSI_P.flatten(), shading='gouraud', cmap='magma', alpha=0.9)
             for r_lev in [0.2, 0.4, 0.6, 0.8, 1.0]:
                 rl, zl = self.compute_geometry(x_core, r_lev, np.linspace(0, 2*np.pi, 100), zv)[:2]
                 ax.plot(rl, zl, color='white', lw=1.2, alpha=0.6)
-            
-            # --- 核心改进：在每个 zeta 上绘制对应的输入 LCFS 目标曲线 (Red Dashed) ---
-            th_target = np.linspace(0, 2*np.pi, 200)
-            R_target_line = 10 - np.cos(th_target) - 0.3 * np.cos(th_target + zv)
-            Z_target_line = np.sin(th_target) - 0.3 * np.sin(th_target + zv)
-            ax.plot(R_target_line, Z_target_line, 'r--', lw=1.5, label='Input LCFS', alpha=0.9)
-            
-            # 强调计算出来的最外层闭合磁面 (Gold)
-            rl_edge, zl_edge = self.compute_geometry(x_core, 1.0, np.linspace(0, 2*np.pi, 100), zv)[:2]
-            ax.plot(rl_edge, zl_edge, color='#FFD700', lw=2.0, label='Solved Boundary')
-
-            ax.set_aspect('equal')
-            ax.set_title(f'Toroidal Angle $\zeta={zv:.2f}$')
-            if i == 0: ax.legend(loc='upper right', fontsize='small')
-
-        fig.tight_layout()
-        plt.show()
+            th_t = np.linspace(0, 2*np.pi, 200)
+            R_t = 10 -  np.cos(th_t) - 0.3 * np.cos(th_t + zv)
+            Z_t = np.sin(th_t) - 0.3 * np.sin(th_t + zv)
+            ax.plot(R_t, Z_t, 'r--', lw=1.5, label='Input LCFS', alpha=0.8)
+            rl_e, zl_e = self.compute_geometry(x_core, 1.0, np.linspace(0, 2*np.pi, 100), zv)[:2]
+            ax.plot(rl_e, zl_e, color='#FFD700', lw=2.0, label='Solved Boundary')
+            ax.set_aspect('equal'); ax.set_title(f'Toroidal Angle $\zeta={zv:.2f}$')
+            if i == 0: ax.legend(loc='upper right', fontsize='x-small')
+        plt.tight_layout(); plt.show()
 
 if __name__ == "__main__":
     VEQ3D_Solver().solve()
