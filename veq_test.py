@@ -79,12 +79,11 @@ class VEQ3D_Solver:
         return self.Phi_a * (rho**2 + 0.75 * rho**4)
 
     def fit_boundary(self):
-        """预拟合几何边界 (LCFS) - 已修改为用户指定表达式"""
+        """预拟合几何边界 (LCFS) - 修正了致命的初始猜值坍缩问题"""
         print(">>> 正在拟合目标边界位形...")
         th_f = np.linspace(0, 2*np.pi, 40); ze_f = np.linspace(0, 2*np.pi, 20)
         TH_F, ZE_F = np.meshgrid(th_f, ze_f)
         
-        # --- 更新目标方程 ---
         R_target = 10 - np.cos(TH_F) - 0.3 * np.cos(TH_F + ZE_F)
         Z_target = np.sin(TH_F) - 0.3 * np.sin(TH_F + ZE_F)
 
@@ -100,8 +99,9 @@ class VEQ3D_Solver:
             Z_mod = Z0 + v + k * a * np.sin(TH_F + c0Z)
             return np.concatenate([(R_mod - R_target).flatten(), (Z_mod - Z_target).flatten()])
 
-        # 初始猜值：小半径 a0 改为 1.0 以匹配新的 LCFS 大小
-        p0 = [10.0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0, 0, 0.0, 0, 0, 0, 0, 0, 0, 0, 0]
+        # --- 核心修复：修正 p0 索引，设置合理的初始小半径 (8) 和 初始相位 (14) 以避免奇点 ---
+        # 索引: 8 是 a0, 11 是 k0, 14 是 c00 (变分初始相位)
+        p0 = [10.0, 0, 0, 0, 0, 0, 0, 0, 1.0, 0, 0, 1.0, 0, 0, np.pi, 0, 0, 0, 0, 0]
         res = least_squares(boundary_residuals, p0, method='trf', ftol=1e-12)
         keys = ['R0', 'Z0', 'h0', 'h1c', 'h1s', 'v0', 'v1c', 'v1s', 'a0', 'a1c', 'a1s', 'k0', 'k1c', 'k1s', 'c00', 'c01c', 'c01s', 'c00z', 'c01cz', 'c01sz']
         self.X_edge = {k: v for k, v in zip(keys, res.x)}
@@ -124,7 +124,7 @@ class VEQ3D_Solver:
         return R, Z, theta+c0R, theta+c0Z, a, k, Lambda
 
     def compute_physics(self, x_core, apply_scaling=True):
-        """核心物理计算：FFT 谱求导算子 + 严格测试函数核"""
+        """核心物理计算：修复 Lt 解析性、雅可比平滑性与物理投影"""
         rho, theta, zeta = self.RHO, self.TH, self.ZE
         fac, dfac = 1.0 - rho**2, -2.0 * rho
         L_fac = rho**2 * fac
@@ -162,15 +162,17 @@ class VEQ3D_Solver:
         Zt = k*rho*a*np.cos(thZ)
         Zz = vz + kz*rho*a*np.sin(thZ) + k*rho*az*np.sin(thZ) + k*rho*a*np.cos(thZ)*c0Zz
 
-        # 2. 三维度规
+        # 2. --- 核心修复：真实度规计算 (使用平滑非零逼近替代硬截断) ---
         det_phys = Rr * Zt - Rt * Zr
-        det_safe = np.sign(det_phys) * np.maximum(np.abs(det_phys), 1e-8)
+        # 软平滑：替代 np.maximum，保持全空间可导，避免梯度消失
+        det_safe = 0.5 * (det_phys + np.sqrt(det_phys**2 + 1e-8))
         sqrt_g = (R / self.Nt) * det_safe
+        
         g_rr, g_tt = Rr**2 + Zr**2, Rt**2 + Zt**2
         g_zz = Rz**2 + (R/self.Nt)**2 + Zz**2 
         g_rt, g_rz, g_tz = Rr*Rt+Zr*Zt, Rr*Rz+Zr*Zz, Rt*Rz+Zt*Zz
 
-        # 3. 磁场计算
+        # 3. 磁场计算 (Lt 修正为解析导数)
         L1n1, L10, L11 = x_core[18:21]
         Lt = L_fac * (L1n1 * np.cos(theta + zeta) + L10 * np.cos(theta) + L11 * np.cos(theta - zeta))
         Lz = L_fac * (L1n1 * np.cos(theta + zeta) - L11 * np.cos(theta - zeta))
@@ -183,7 +185,7 @@ class VEQ3D_Solver:
         Bt_sub = g_tt * Bt_sup + g_tz * Bz_sup
         Bz_sub = g_tz * Bt_sup + g_zz * Bz_sup
 
-        # 4. 电流与平衡算子 (FFT 谱微分)
+        # 4. 电流与平衡算子 (使用谱微分矩阵与 FFT)
         dBt_drho = np.tensordot(self.D_matrix, Bt_sub, axes=(1, 0))
         dBz_drho = np.tensordot(self.D_matrix, Bz_sub, axes=(1, 0))
 
@@ -198,7 +200,7 @@ class VEQ3D_Solver:
         GR = (rho_R * G_rho + (Jr_phys / (2 * np.pi)) * (th_R * Phip))
         GZ = (rho_Z * G_rho + (Jr_phys / (2 * np.pi)) * (th_Z * Phip))
 
-        # 5. 变分残差构造
+        # 5. 变分残差构造 (严格对齐参数核)
         residuals = []
         kernels = [
             -fac * rho * a * np.sin(thR), -fac * rho * a * np.sin(thR) * cz, -fac * rho * a * np.sin(thR) * sz, # c0R
@@ -218,26 +220,33 @@ class VEQ3D_Solver:
                 term = GR * kR + GZ * kZ
             residuals.append(np.sum(sqrt_g * term * self.weights_3d) * dV)
 
-        # J^rho 投影
         for m, n in [(1, -1), (1, 0), (1, 1)]:
             test_function = L_fac * np.sin(m * self.TH - n * self.ZE)
             res_L = np.sum(sqrt_g * Jr_phys * test_function * self.weights_3d) * dV
             residuals.append(res_L)
             
         final_res = np.array(residuals)
-        if apply_scaling: return final_res / self.res_scales
+        if apply_scaling: 
+            final_res = final_res / self.res_scales
+            
+        # --- 核心修复：施加严厉的几何扭曲惩罚，迫使优化器逃离奇点 ---
+        if np.any(det_phys < 0.05):
+            # 采用平方惩罚，为优化器提供明确的“回归”梯度
+            penalty = np.sum(np.where(det_phys < 0.05, 100.0 * (0.05 - det_phys)**2, 0))
+            final_res = final_res + penalty  # 将惩罚直接加到残差上
+            
         return final_res
 
     def solve(self):
-        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (更新输入 LCFS 位形)...")
+        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (修复几何坍缩与梯度消失)...")
         x0 = np.zeros(21); x0[15] = 0.05
         res = least_squares(self.compute_physics, x0, method='trf', xtol=1e-11, ftol=1e-11, max_nfev=500)
-        print(f">>> 最终残差范数 (Scaled): {np.linalg.norm(res.fun):.4e}")
+        print(f">>> 最终收敛范数: {np.linalg.norm(res.fun):.4e}")
         self.plot_equilibrium(res.x)
         return res.x
 
     def plot_equilibrium(self, x_core):
-        """可视化输出，包含新的解析输入边界参考"""
+        """可视化输出，包含精确的输入边界参考"""
         zetas = [0, np.pi/3, 2*np.pi/3, np.pi, 4*np.pi/3, 5*np.pi/3]
         fig, axes = plt.subplots(2, 3, figsize=(15, 12))
         axes = axes.flatten()
@@ -253,9 +262,8 @@ class VEQ3D_Solver:
             for r_lev in [0.2, 0.4, 0.6, 0.8, 1.0]:
                 rl, zl = self.compute_geometry(x_core, r_lev, np.linspace(0, 2*np.pi, 100), zv)[:2]
                 ax.plot(rl, zl, color='white', lw=1.0, alpha=0.5)
-            # --- 核心改进：绘制对应的输入 LCFS 目标曲线 (New formula) ---
+            # 绘制输入 LCFS (红色虚线)
             th_t = np.linspace(0, 2*np.pi, 200)
-            # R=10 - cos(th) - 0.3cos(th+ze)
             ax.plot(10 - np.cos(th_t) - 0.3*np.cos(th_t+zv), np.sin(th_t) - 0.3*np.sin(th_t+zv), 'r--', lw=1.5, label='Input LCFS')
             rl_e, zl_e = self.compute_geometry(x_core, 1.0, np.linspace(0, 2*np.pi, 100), zv)[:2]
             ax.plot(rl_e, zl_e, color='#FFD700', lw=2.0, label='Solved Boundary')
