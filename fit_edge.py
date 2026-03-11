@@ -2,7 +2,7 @@ import numpy as np
 from scipy.optimize import least_squares
 import matplotlib.pyplot as plt
 
-RRR=2
+RRR=1
 ZZZ=1
 
 # ==========================================
@@ -118,9 +118,9 @@ def residuals(p, theta, zeta, R_target, Z_target, N, M_R, M_Z):
 # ==========================================
 # 2. 核心设置与 多级升阶优化策略 (Spectral Refinement)
 # ==========================================
-N_tor = 3 
-M_R_final = 3  
-M_Z_final = 3  
+N_tor = 1 
+M_R_final = 1 
+M_Z_final = 1  
 
 N_grid_theta = 33  
 N_grid_zeta = 33   
@@ -137,6 +137,11 @@ print(f"开始执行多级逐步优化 (Spectral Refinement), 目标 M_R={M_R_fi
 
 # 初始化 M=0 的基础参数 guess
 p_current = np.zeros(get_num_params(N_tor, 0, 0))
+# p_current[0] = 10.0      # R0
+# p_current[1] = 0.0       # Z0
+# p_current[2 + 2*(1+2*N_tor)] = 1.0           # a_0
+# p_current[2 + 3*(1+2*N_tor)] = 1.0           # kappa_0
+# p_current[2 + 4*(1+2*N_tor)] = np.pi         # c_{00}^R
 
 # 恢复基于极向模数的逐步升阶循环
 max_steps = max(M_R_final, M_Z_final)
