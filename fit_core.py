@@ -7,8 +7,8 @@ import os
 # ==========================================
 # 0. 全局配置与阶数设定
 # ==========================================
-N_thetaR = 1    # thetaR 极向扰动的环向展开阶数 (对应 PDF 的 N_R)
-N_thetaZ = 1    # thetaZ 极向扰动的环向展开阶数 (对应 PDF 的 N_Z)
+N_thetaR = 1    # thetaR 极向扰动的环向展开阶数
+N_thetaZ = 1    # thetaZ 极向扰动的环向展开阶数
 N_c0R = 1       # c0R 的环向展开阶数
 N_c0Z = 1       # c0Z 的环向展开阶数
 N_h = 1         # h 的环向展开阶数
@@ -46,10 +46,6 @@ def eval_fourier(coeffs, zeta, N):
     return val
 
 def calc_components(p_sub, theta, zeta, M_R, M_Z):
-    """
-    核心加速黑科技：傅里叶变换是线性的，分别解析edge和core，
-    之后通过(1-rho^2)组合避免复杂张量广播。
-    """
     idx = 0
     def get_F(order):
         nonlocal idx
@@ -93,9 +89,6 @@ def calc_components(p_sub, theta, zeta, M_R, M_Z):
 # 2. 全空间物理模型构建
 # ==========================================
 def calc_full_space(p_edge, p_core, rho, theta, zeta, M_R, M_Z):
-    """
-    结合边界系数和核心系数，计算任意 (rho, theta, zeta) 的 R, Z
-    """
     R0, Z0 = p_edge[0], p_edge[1]
     p_edge_sub = p_edge[2:]
     
@@ -126,7 +119,16 @@ def calc_full_space(p_edge, p_core, rho, theta, zeta, M_R, M_Z):
 # ==========================================
 def residuals_edge(p_edge, theta, zeta, R_target, Z_target, M_R, M_Z):
     R_mod, Z_mod = calc_full_space(p_edge, None, 1.0, theta, zeta, M_R, M_Z)
-    return np.concatenate([(R_mod - R_target), (Z_mod - Z_target)])
+    res_geom = np.concatenate([(R_mod - R_target), (Z_mod - Z_target)])
+    
+    idx_h0 = 2
+    idx_v0 = 2 + (1 + 2 * N_h)
+    idx_a0 = 2 + (1 + 2 * N_h) + (1 + 2 * N_nu)
+    
+    res_reg = np.array([p_edge[idx_h0], p_edge[idx_v0]]) * 50.0
+    res_a0 = np.where(p_edge[idx_a0] < 0.1, (0.5 - p_edge[idx_a0]) * 20.0, 0.0)
+    
+    return np.concatenate([res_geom, res_reg, [res_a0]])
 
 def residuals_core(p_core, p_edge_fixed, rho, theta, zeta, R_target, Z_target, M_R, M_Z):
     R_mod, Z_mod = calc_full_space(p_edge_fixed, p_core, rho, theta, zeta, M_R, M_Z)
@@ -136,75 +138,55 @@ def upgrade_params_edge(p_old, M_R_old, M_Z_old, M_R_new, M_Z_new):
     if M_R_old == M_R_new and M_Z_old == M_Z_new: return p_old.copy()
     base_len = 2 + (1 + 2 * N_h) + (1 + 2 * N_nu) + (1 + 2 * N_a) + (1 + 2 * N_kappa) + (1 + 2 * N_c0R) + (1 + 2 * N_c0Z)
     base = p_old[:base_len]
-    
     len_pR_old = 2 * M_R_old * (2 * N_thetaR + 1)
     len_pZ_old = 2 * M_Z_old * (2 * N_thetaZ + 1)
-    
     tR_old = p_old[base_len : base_len+len_pR_old] if len_pR_old > 0 else np.array([])
     tZ_old = p_old[base_len+len_pR_old : base_len+len_pR_old+len_pZ_old] if len_pZ_old > 0 else np.array([])
-        
     len_add_R = 2 * (M_R_new - M_R_old) * (2 * N_thetaR + 1)
     len_add_Z = 2 * (M_Z_new - M_Z_old) * (2 * N_thetaZ + 1)
-    
     tR_new = np.concatenate([tR_old, np.zeros(len_add_R)]) if len_add_R > 0 else tR_old.copy()
     tZ_new = np.concatenate([tZ_old, np.zeros(len_add_Z)]) if len_add_Z > 0 else tZ_old.copy()
-    
     return np.concatenate([base, tR_new, tZ_new])
 
 # ==========================================
-# 4. 数据加载与降采样 (Data Pre-processing)
+# 4. 数据加载
 # ==========================================
 def generate_mock_data():
-    print(">>> 未检测到 'RZ_data.txt'，正在生成数据...")
+    print(">>> 未检测到 'RZ_data.txt'，正在生成模拟 DESC 数据...")
     rhos = np.linspace(0.1, 1.0, 10)
-    thetas = np.linspace(0, 2*np.pi, 30, endpoint=False)
-    zetas = np.linspace(0, 2*np.pi, 12, endpoint=False)
-    
+    thetas = np.linspace(0, 2*np.pi, 40, endpoint=False)
+    zetas = np.linspace(0, 2*np.pi, 20, endpoint=False)
     data = []
     for rho in rhos:
         for theta in thetas:
             for zeta in zetas:
-                h = 0.5 * (1 - rho**2) + 0.1 * np.cos(zeta)
-                a = 3.0 - 0.5 * (1 - rho**2)
-                kappa = 1.6 + 0.2 * (1 - rho**2)
-                tR = 0.1 * rho * np.sin(theta - zeta)
-                tZ = 0.1 * rho * np.cos(theta - zeta)
-                R = 10.0 + h + rho * a * np.cos(theta + tR)
-                Z = 0.0 + kappa * rho * a * np.sin(theta + tZ)
-                data.append([rho, theta, zeta/19, R, Z]) # 模拟 phi 数据
+                R = 10.0 + 0.1*(1-rho**2) + rho * 1.0 * np.cos(theta + np.pi + 0.1*np.sin(zeta))
+                Z = 0.0 + 1.6 * rho * 1.0 * np.sin(theta + np.pi)
+                data.append([rho, theta, zeta, R, Z])
     df = pd.DataFrame(data, columns=['rho', 'theta', 'zeta', 'R', 'Z'])
     df.to_csv("RZ_data.txt", index=False)
 
 if not os.path.exists("RZ_data.txt"):
     generate_mock_data()
 
-print("\n[第一阶段] 数据加载与分层降采样")
+print("\n[第一阶段] 数据加载与分层")
 df = pd.read_csv("RZ_data.txt")
-
-# 【绝对核心修复】：将原数据中的单周期相位 phi 转换回完整的环向角 zeta
-df['zeta'] = df['zeta'] * 19
-
-# 回退到干净的按 rho 提取逻辑
 df_edge = df[df['rho'] >= 0.99].copy()
 df_core = df[df['rho'] < 0.99].copy()
-
-MAX_CORE_PTS = 5000
-if len(df_core) > MAX_CORE_PTS:
-    print(f"内部点总数为 {len(df_core)}，执行随机降采样至 {MAX_CORE_PTS} 点。")
-    df_core = df_core.sample(n=MAX_CORE_PTS, random_state=42)
-
-print(f"  边界拟合点数: {len(df_edge)}")
-print(f"  核心拟合点数: {len(df_core)}")
 
 # ==========================================
 # 5. 执行两步走拟合策略
 # ==========================================
-print("\n[第二阶段] 步骤 1: 纯边界拟合 (Spectral Refinement on rho=1)")
+print("\n[第二阶段] 步骤 1: 纯边界拟合 (带有正则化与初始猜值修正)")
 p_edge_opt = np.zeros(get_num_params_edge(0, 0))
 p_edge_opt[0] = df_edge['R'].mean()   # R0
 p_edge_opt[1] = 0.0                   # Z0
-idx_a0 = 2 + (1 + 2 * N_h) + (1 + 2 * N_nu) # 动态定位 a0 的位置
-p_edge_opt[idx_a0] = (df_edge['R'].max() - df_edge['R'].min())/2.0 # a0
+idx_a0 = 2 + (1 + 2 * N_h) + (1 + 2 * N_nu)
+idx_k0 = 2 + (1 + 2 * N_h) + (1 + 2 * N_nu) + (1 + 2 * N_a)
+idx_c00R = 2 + (1 + 2 * N_h) + (1 + 2 * N_nu) + (1 + 2 * N_a) + (1 + 2 * N_kappa)
+p_edge_opt[idx_a0] = 1.0             
+p_edge_opt[idx_k0] = 1.6             
+p_edge_opt[idx_c00R] = np.pi         
 
 max_steps = max(M_R_final, M_Z_final)
 m_R_old, m_Z_old = 0, 0
@@ -213,24 +195,20 @@ for step in range(max_steps + 1):
     m_R_curr = min(step, M_R_final)
     m_Z_curr = min(step, M_Z_final)
     print(f"  >>> 边界升阶 ({step}/{max_steps}): M_R={m_R_curr}, M_Z={m_Z_curr}")
-    
     if step > 0:
         p_edge_opt = upgrade_params_edge(p_edge_opt, m_R_old, m_Z_old, m_R_curr, m_Z_curr)
-    
-    ftol_val = 1e-10 if step == max_steps else 1e-6
     res_edge = least_squares(
         residuals_edge, p_edge_opt, 
         args=(df_edge['theta'].values, df_edge['zeta'].values, 
               df_edge['R'].values, df_edge['Z'].values, m_R_curr, m_Z_curr),
-        method='trf', loss='huber', ftol=ftol_val
+        method='trf', loss='huber', ftol=1e-10
     )
     p_edge_opt = res_edge.x
     m_R_old, m_Z_old = m_R_curr, m_Z_curr
-    print(f"      Cost = {res_edge.cost:.4e}")
+    print(f"      Cost = {res_edge.cost:.4e} | R0={p_edge_opt[0]:.3f}, a0={p_edge_opt[idx_a0]:.3f}")
 
-print("\n[第三阶段] 步骤 2: 冻结边界，拟合内部核心展开系数 (rho < 1)")
+print("\n[第三阶段] 步骤 2: 冻结边界，拟合内部核心展开系数")
 p_core_guess = np.zeros(get_num_params_core(M_R_final, M_Z_final))
-
 res_core = least_squares(
     residuals_core, p_core_guess,
     args=(p_edge_opt, df_core['rho'].values, df_core['theta'].values, df_core['zeta'].values,
@@ -241,72 +219,66 @@ p_core_opt = res_core.x
 print(f"  >>> 内部拟合完成！最终 Cost = {res_core.cost:.4e}")
 
 # ==========================================
-# 5.5 输出所有迭代后的参数名称和数值
+# 6. 最终参数输出函数 (完整版)
 # ==========================================
 def print_optimized_parameters(p_edge, p_core, M_R, M_Z):
-    print("\n" + "="*70)
-    print(">>> 优化完成！输出最终拟合参数 (依据《拟合边界》命名规范) <<<")
-    print("="*70)
+    print("\n" + "="*80)
+    print(f"{'>>> 3D 拟合参数报告 (LCFS vs Core Radial Coeffs) <<<':^80}")
+    print("="*80)
     
-    print(f"R_0 = {p_edge[0]:.8e}")
-    print(f"Z_0 = {p_edge[1]:.8e}")
+    print(f"R_0 (Major Radius) = {p_edge[0]:.8e}")
+    print(f"Z_0 (Vertical Pos) = {p_edge[1]:.8e}")
     
     def print_fourier_group(var_id, N, idx_e_start, idx_c_start):
-        idx_e = idx_e_start
-        idx_c = idx_c_start
+        idx_e, idx_c = idx_e_start, idx_c_start
+        ax = "R" if "R" in var_id else "Z"
         
-        if var_id in ["c0R", "c0Z"]:
-            ax = "R" if var_id == "c0R" else "Z"
-            print(f"c_{{00}}^{ax}(edge) = {p_edge[idx_e]:.8e}, c_{{00}}^{ax}(core) = {p_core[idx_c]:.8e}")
-            idx_e += 1; idx_c += 1
-            for n in range(1, N + 1):
-                print(f"c_{{0{n}}}^{{{ax},c}}(edge) = {p_edge[idx_e]:.8e}, c_{{0{n}}}^{{{ax},c}}(core) = {p_core[idx_c]:.8e}")
-                idx_e += 1; idx_c += 1
-                print(f"c_{{0{n}}}^{{{ax},s}}(edge) = {p_edge[idx_e]:.8e}, c_{{0{n}}}^{{{ax},s}}(core) = {p_core[idx_c]:.8e}")
-                idx_e += 1; idx_c += 1
-        else:
-            name = var_id
-            print(f"{name}_0(edge) = {p_edge[idx_e]:.8e}, {name}_0(core) = {p_core[idx_c]:.8e}")
-            idx_e += 1; idx_c += 1
-            for n in range(1, N + 1):
-                print(f"{name}_{{{n}c}}(edge) = {p_edge[idx_e]:.8e}, {name}_{{{n}c}}(core) = {p_core[idx_c]:.8e}")
-                idx_e += 1; idx_c += 1
-                print(f"{name}_{{{n}s}}(edge) = {p_edge[idx_e]:.8e}, {name}_{{{n}s}}(core) = {p_core[idx_c]:.8e}")
+        # 处理常数项 (n=0)
+        e_val, c_val = p_edge[idx_e], p_core[idx_c]
+        name = var_id.replace("0", "_{00}")
+        print(f"{name:<12}(edge) = {e_val:>15.8e} | {name:<12}(core) = {c_val:>15.8e}")
+        idx_e += 1; idx_c += 1
+        
+        # 处理环向谐波 (n > 0)
+        for n in range(1, N + 1):
+            for suffix in ["c", "s"]:
+                e_val, c_val = p_edge[idx_e], p_core[idx_c]
+                tag = f"{var_id}_{{{n}{suffix}}}"
+                print(f"{tag:<12}(edge) = {e_val:>15.8e} | {tag:<12}(core) = {c_val:>15.8e}")
                 idx_e += 1; idx_c += 1
         return idx_e, idx_c
+
+    curr_e, curr_c = 2, 0
+    print("\n[1] 基础几何参数 (h, nu, a, kappa):")
+    curr_e, curr_c = print_fourier_group("h", N_h, curr_e, curr_c)
+    curr_e, curr_c = print_fourier_group("nu", N_nu, curr_e, curr_c)
+    curr_e, curr_c = print_fourier_group("a", N_a, curr_e, curr_c)
+    curr_e, curr_c = print_fourier_group("kappa", N_kappa, curr_e, curr_c)
     
-    idx_e = 2
-    idx_c = 0
-    
-    print("\n[基础傅里叶参数 h, \\nu (v), a, \\kappa]")
-    idx_e, idx_c = print_fourier_group("h", N_h, idx_e, idx_c)
-    idx_e, idx_c = print_fourier_group("\\nu", N_nu, idx_e, idx_c)
-    idx_e, idx_c = print_fourier_group("a", N_a, idx_e, idx_c)
-    idx_e, idx_c = print_fourier_group("\\kappa", N_kappa, idx_e, idx_c)
-    
-    print("\n[基准变分角常数 c_0^R, c_0^Z]")
-    idx_e, idx_c = print_fourier_group("c0R", N_c0R, idx_e, idx_c)
-    idx_e, idx_c = print_fourier_group("c0Z", N_c0Z, idx_e, idx_c)
+    print("\n[2] 基准变分角相位 (c0R, c0Z):")
+    curr_e, curr_c = print_fourier_group("c0R", N_c0R, curr_e, curr_c)
+    curr_e, curr_c = print_fourier_group("c0Z", N_c0Z, curr_e, curr_c)
     
     if ENABLE_POLOIDAL_PERTURBATION:
-        print("\n[极向摄动参数 \\theta_R]")
+        print("\n[3] 极向摄动谐波 (theta_R Perturbations):")
         for m in range(1, M_R + 1):
             for n in range(-N_thetaR, N_thetaR + 1):
-                c_edge, s_edge = p_edge[idx_e], p_edge[idx_e+1]
-                c_core, s_core = p_core[idx_c], p_core[idx_c+1]
-                print(f"c_{{{m},{n}}}^R(edge) = {c_edge:.8e}, c_{{{m},{n}}}^R(core) = {c_core:.8e}")
-                print(f"s_{{{m},{n}}}^R(edge) = {s_edge:.8e}, s_{{{m},{n}}}^R(core) = {s_core:.8e}")
-                idx_e += 2; idx_c += 2
-
-        print("\n[极向摄动参数 \\theta_Z]")
+                for suffix in ["c", "s"]:
+                    e_v, c_v = p_edge[curr_e], p_core[curr_c]
+                    label = f"c_{{{m},{n}}}^R" if suffix=="c" else f"s_{{{m},{n}}}^R"
+                    print(f"{label:<12}(edge) = {e_v:>15.8e} | {label:<12}(core) = {c_v:>15.8e}")
+                    curr_e += 1; curr_c += 1
+        
+        print("\n[4] 极向摄动谐波 (theta_Z Perturbations):")
         for m in range(1, M_Z + 1):
             for n in range(-N_thetaZ, N_thetaZ + 1):
-                c_edge, s_edge = p_edge[idx_e], p_edge[idx_e+1]
-                c_core, s_core = p_core[idx_c], p_core[idx_c+1]
-                print(f"c_{{{m},{n}}}^Z(edge) = {c_edge:.8e}, c_{{{m},{n}}}^Z(core) = {c_core:.8e}")
-                print(f"s_{{{m},{n}}}^Z(edge) = {s_edge:.8e}, s_{{{m},{n}}}^Z(core) = {s_core:.8e}")
-                idx_e += 2; idx_c += 2
-    print("="*70 + "\n")
+                for suffix in ["c", "s"]:
+                    e_v, c_v = p_edge[curr_e], p_core[curr_c]
+                    label = f"c_{{{m},{n}}}^Z" if suffix=="c" else f"s_{{{m},{n}}}^Z"
+                    print(f"{label:<12}(edge) = {e_v:>15.8e} | {label:<12}(core) = {c_v:>15.8e}")
+                    curr_e += 1; curr_c += 1
+    
+    print("="*80 + "\n")
 
 print_optimized_parameters(p_edge_opt, p_core_opt, M_R_final, M_Z_final)
 
