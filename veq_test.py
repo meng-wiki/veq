@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 class VEQ3D_Solver:
     def __init__(self):
         # 1. 物理常数 (严格回归 SI 单位制以对齐 DESC)
-        self.Nt = 1                  # 周期数
+        self.Nt = 19                  # 周期数
         self.Phi_a = 1.0             # 总环向磁通 (Wb)
         self.mu_0 = 4 * np.pi * 1e-7 # 真空磁导率 (H/m)
         
@@ -20,10 +20,10 @@ class VEQ3D_Solver:
         self.rho = 0.5 * (rho_nodes + 1)
         self.rho_weights *= 0.5
         
-        # 预计算勒让德谱微分矩阵 D (用于径向谱求导)
+        # 预计算勒让德谱微分矩阵 D
         self.D_matrix = self._get_legendre_diff_matrix(self.rho)
         
-        # 预计算 FFT 波数向量 (用于角向高精度谱求导)
+        # 预计算 FFT 波数向量
         self.k_th = np.fft.fftfreq(self.Nt_grid, d=1.0/self.Nt_grid)[None, :, None]
         self.k_ze = np.fft.fftfreq(self.Nz_grid, d=1.0/self.Nz_grid)[None, None, :]
         
@@ -79,11 +79,12 @@ class VEQ3D_Solver:
         return self.Phi_a * (rho**2 + 0.75 * rho**4)
 
     def fit_boundary(self):
-        """预拟合几何边界 (LCFS) - 修正了致命的初始猜值坍缩问题"""
+        """预拟合几何边界 (LCFS) - 支持顺时针/左手系方程"""
         print(">>> 正在拟合目标边界位形...")
         th_f = np.linspace(0, 2*np.pi, 40); ze_f = np.linspace(0, 2*np.pi, 20)
         TH_F, ZE_F = np.meshgrid(th_f, ze_f)
         
+        # 保留用户最初设定的目标方程
         R_target = 10 - np.cos(TH_F) - 0.3 * np.cos(TH_F + ZE_F)
         Z_target = np.sin(TH_F) - 0.3 * np.sin(TH_F + ZE_F)
 
@@ -97,10 +98,16 @@ class VEQ3D_Solver:
             c0Z = c00z + c01cz*np.cos(ZE_F) + c01sz*np.sin(ZE_F)
             R_mod = R0 + h + a * np.cos(TH_F + c0R)
             Z_mod = Z0 + v + k * a * np.sin(TH_F + c0Z)
-            return np.concatenate([(R_mod - R_target).flatten(), (Z_mod - Z_target).flatten()])
+            
+            res_geom = np.concatenate([(R_mod - R_target).flatten(), (Z_mod - Z_target).flatten()])
+            # 加入正则化惩罚，打破 R0 和 h0 的线性简并
+            res_reg = np.array([h0, v0]) * 100.0
+            return np.concatenate([res_geom, res_reg])
 
-        # 索引: 8 是 a0, 11 是 k0, 14 是 c00 (变分初始相位设为 pi)
-        p0 = [10.0, 0, 0, 0, 0, 0, 0, 0, 1.0, 0, 0, 1.0, 0, 0, np.pi, 0, 0, 0, 0, 0]
+        # 核心修改：为左手系边界提供正确的相位猜测
+        # 索引 14 (c00) 设为 pi，让 R 表现为 -cos; 索引 17 (c00z) 设为 0，让 Z 表现为 +sin
+        p0 = [10.0, 0, 0, 0, 0, 0, 0, 0, 1.0, 0, 0, 1.0, 0, 0, np.pi, 0, 0, 0.0, 0, 0]
+        
         res = least_squares(boundary_residuals, p0, method='trf', ftol=1e-12)
         keys = ['R0', 'Z0', 'h0', 'h1c', 'h1s', 'v0', 'v1c', 'v1s', 'a0', 'a1c', 'a1s', 'k0', 'k1c', 'k1s', 'c00', 'c01c', 'c01s', 'c00z', 'c01cz', 'c01sz']
         self.X_edge = {k: v for k, v in zip(keys, res.x)}
@@ -108,7 +115,7 @@ class VEQ3D_Solver:
 
     def compute_geometry(self, x_core, rho, theta, zeta):
         fac = 1.0 - rho**2
-        L_fac = rho**2 * fac # 消除磁轴奇异性
+        L_fac = rho**2 * fac 
         
         c0R = (self.X_edge['c00'] + x_core[0]*fac) + (self.X_edge['c01c'] + x_core[1]*fac)*np.cos(zeta) + (self.X_edge['c01s'] + x_core[2]*fac)*np.sin(zeta)
         c0Z = (self.X_edge['c00z'] + x_core[3]*fac) + (self.X_edge['c01cz'] + x_core[4]*fac)*np.cos(zeta) + (self.X_edge['c01sz'] + x_core[5]*fac)*np.sin(zeta)
@@ -161,16 +168,17 @@ class VEQ3D_Solver:
         Zt = k*rho*a*np.cos(thZ)
         Zz = vz + kz*rho*a*np.sin(thZ) + k*rho*az*np.sin(thZ) + k*rho*a*np.cos(thZ)*c0Zz
 
-        # 2. 真实度规计算 (使用平滑非零逼近)
+        # 2. 真实度规计算 (接受负雅可比，保持偏导数符号正确)
         det_phys = Rr * Zt - Rt * Zr
-        det_safe = 0.5 * (det_phys + np.sqrt(det_phys**2 + 1e-8))
+        # 为了数值安全，直接使用 det_phys 而不强行变正
+        det_safe = det_phys  
         sqrt_g = (R / self.Nt) * det_safe
         
         g_rr, g_tt = Rr**2 + Zr**2, Rt**2 + Zt**2
         g_zz = Rz**2 + (R/self.Nt)**2 + Zz**2 
         g_rt, g_rz, g_tz = Rr*Rt+Zr*Zt, Rr*Rz+Zr*Zz, Rt*Rz+Zt*Zz
 
-        # 3. 磁场计算 (Lt 修正为基于原始角坐标计算精确 Lt)
+        # 3. 磁场计算 (Lt 修正为解析导数)
         L1n1, L10, L11 = x_core[18:21]
         Lt = L_fac * (L1n1 * np.cos(theta + zeta) + L10 * np.cos(theta) + L11 * np.cos(theta - zeta))
         Lz = L_fac * (L1n1 * np.cos(theta + zeta) - L11 * np.cos(theta - zeta))
@@ -227,10 +235,9 @@ class VEQ3D_Solver:
         if apply_scaling: 
             final_res = final_res / self.res_scales
             
-        # --- 核心修复：保护磁轴物理奇点，仅惩罚真实的网格翻转 (det_phys < -1e-4) ---
-        if np.any(det_phys < -1e-4):
-            # 采用乘性惩罚，避免广播机制破坏残差独立性
-            penalty = np.sum(np.where(det_phys < -1e-4, 100.0 * (-1e-4 - det_phys)**2, 0))
+        # --- 核心修复：反转拓扑奇点惩罚。由于是顺时针，雅可比为负；若大于极小正值，则说明网格翻转了 ---
+        if np.any(det_phys > 1e-4):
+            penalty = np.sum(np.where(det_phys > 1e-4, 100.0 * (det_phys - 1e-4)**2, 0))
             final_res = final_res * (1.0 + penalty)  
             
         return final_res
@@ -241,7 +248,6 @@ class VEQ3D_Solver:
         print(f"{'VEQ-3D 拟合参数报告 (Final Parameters)':^60}")
         print("="*60)
         
-        # 1. 边界参数 (X_edge)
         print(f"\n[1] 边界固定参数 (X_edge - LCFS Definition):")
         print("-" * 60)
         edge_map = [
@@ -257,45 +263,39 @@ class VEQ3D_Solver:
             val = self.X_edge.get(key, 0.0)
             print(f"{key:<8} | {val:>15.8e} | {desc}")
 
-        # 2. 核心待求参数 (X_core - Radial Variation Coefficients)
         print(f"\n[2] 核心平衡参数 (X_core - Coefficients of (1-rho^2)):")
         print("-" * 60)
         core_names = [
-            "c00_1", "c01c_1", "c01s_1",       # c0R radial coefs
-            "c00z_1", "c01cz_1", "c01sz_1",    # c0Z radial coefs
-            "h0_1", "h1c_1", "h1s_1",          # h radial coefs
-            "v0_1", "v1c_1", "v1s_1",          # v radial coefs
-            "k0_1", "k1c_1", "k1s_1",          # k radial coefs
-            "a0_1", "a1c_1", "a1s_1"           # a radial coefs
+            "c00_1", "c01c_1", "c01s_1",       
+            "c00z_1", "c01cz_1", "c01sz_1",    
+            "h0_1", "h1c_1", "h1s_1",          
+            "v0_1", "v1c_1", "v1s_1",          
+            "k0_1", "k1c_1", "k1s_1",          
+            "a0_1", "a1c_1", "a1s_1"           
         ]
         for i, name in enumerate(core_names):
             print(f"{name:<8} | {x_core[i]:>15.8e} | {name.split('_')[0]} 的径向演化系数")
 
-        # 3. 流函数参数 (Lambda_mn)
         print(f"\n[3] 流函数参数 (Lambda_mn - Coefficients of rho^2(1-rho^2)):")
         print("-" * 60)
         lambda_modes = [("1,-1", "L_1n1_1"), ("1,0", "L_10_1"), ("1,1", "L_11_1")]
         for i, (mode, name) in enumerate(lambda_modes):
             val = x_core[18+i]
             print(f"{name:<8} | {val:>15.8e} | (m,n)=({mode}) 谐波振幅")
-            
         print("="*60 + "\n")
 
     def solve(self):
-        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (修复磁轴惩罚与几何初值)...")
+        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (修复手性与参数简并)...")
         x0 = np.zeros(21); x0[15] = 0.05
         res = least_squares(self.compute_physics, x0, method='trf', xtol=1e-11, ftol=1e-11, max_nfev=500)
         
         print(f">>> 最终收敛范数: {np.linalg.norm(res.fun):.4e}")
-        
-        # 输出最终参数
         self.print_final_parameters(res.x)
-        
         self.plot_equilibrium(res.x)
         return res.x
 
     def plot_equilibrium(self, x_core):
-        """可视化输出，包含精确的输入边界参考"""
+        """可视化输出，包含精确的顺时针输入边界参考"""
         zetas = [0, np.pi/3, 2*np.pi/3, np.pi, 4*np.pi/3, 5*np.pi/3]
         fig, axes = plt.subplots(2, 3, figsize=(15, 12))
         axes = axes.flatten()
@@ -311,9 +311,11 @@ class VEQ3D_Solver:
             for r_lev in [0.2, 0.4, 0.6, 0.8, 1.0]:
                 rl, zl = self.compute_geometry(x_core, r_lev, np.linspace(0, 2*np.pi, 100), zv)[:2]
                 ax.plot(rl, zl, color='white', lw=1.0, alpha=0.5)
-            # 绘制输入 LCFS (红色虚线)
+            
+            # 完全保留原始定义的 LCFS 红色虚线参考
             th_t = np.linspace(0, 2*np.pi, 200)
             ax.plot(10 - np.cos(th_t) - 0.3*np.cos(th_t+zv), np.sin(th_t) - 0.3*np.sin(th_t+zv), 'r--', lw=1.5, label='Input LCFS')
+            
             rl_e, zl_e = self.compute_geometry(x_core, 1.0, np.linspace(0, 2*np.pi, 100), zv)[:2]
             ax.plot(rl_e, zl_e, color='#FFD700', lw=2.0, label='Solved Boundary')
             ax.set_aspect('equal'); ax.set_title(f'Toroidal Angle $\zeta={zv:.2f}$'); 
