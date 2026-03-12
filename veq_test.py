@@ -2,6 +2,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.special import roots_legendre
 import matplotlib.pyplot as plt
+import time
 
 class VEQ3D_Solver:
     def __init__(self):
@@ -60,10 +61,12 @@ class VEQ3D_Solver:
         return D
 
     def _initialize_scaling(self):
-        print(">>> 正在执行物理量纲归一化预条件...")
-        x0 = np.zeros(21); x0[15] = 0.05
-        raw_res = self.compute_physics(x0, apply_scaling=False)
-        self.res_scales = np.maximum(np.abs(raw_res), 1e-3)
+        print(">>> 正在应用基于物理特征值的矩阵预条件...")
+        # 【修复1】：废弃原先的 raw_res 探测，避免在初始零猜测时梯度失真。
+        # 使用固定的物理量级：前18个为几何力平衡(牛顿量级~1e5)，后3个为电流约束(安培/平方米~1e6)
+        self.res_scales = np.ones(21)
+        self.res_scales[:18] = 1e5
+        self.res_scales[18:] = 1e6
 
     def get_profiles(self, rho):
         """第7节: 恢复 SI 物理压强剖面"""
@@ -115,7 +118,9 @@ class VEQ3D_Solver:
 
     def compute_geometry(self, x_core, rho, theta, zeta):
         fac = 1.0 - rho**2
-        L_fac = rho**2 * fac 
+        # 【修复2A】：修正流函数径向包络宇称！消除 m=1 谐波在原点处的 1/rho 奇点。
+        # 原来是 rho**2 * fac，这会导致电流发散。必须改为 rho * fac。
+        L_fac = rho * fac 
         
         c0R = (self.X_edge['c00'] + x_core[0]*fac) + (self.X_edge['c01c'] + x_core[1]*fac)*np.cos(zeta) + (self.X_edge['c01s'] + x_core[2]*fac)*np.sin(zeta)
         c0Z = (self.X_edge['c00z'] + x_core[3]*fac) + (self.X_edge['c01cz'] + x_core[4]*fac)*np.cos(zeta) + (self.X_edge['c01sz'] + x_core[5]*fac)*np.sin(zeta)
@@ -126,6 +131,7 @@ class VEQ3D_Solver:
         
         R = self.X_edge['R0'] + h + rho * a * np.cos(theta + c0R)
         Z = self.X_edge['Z0'] + v + k * rho * a * np.sin(theta + c0Z)
+        
         Lambda = L_fac * (x_core[18] * np.sin(theta + zeta) + x_core[19] * np.sin(theta) + x_core[20] * np.sin(theta - zeta))
         return R, Z, theta+c0R, theta+c0Z, a, k, Lambda
 
@@ -133,7 +139,9 @@ class VEQ3D_Solver:
         """核心物理计算：修复 Lt 解析性、雅可比平滑性与物理惩罚"""
         rho, theta, zeta = self.RHO, self.TH, self.ZE
         fac, dfac = 1.0 - rho**2, -2.0 * rho
-        L_fac = rho**2 * fac
+        
+        # 【修复2B】：保持与 compute_geometry 一致的宇称修正
+        L_fac = rho * fac
         cz, sz = np.cos(zeta), np.sin(zeta)
         
         def spectral_grad_th(f):
@@ -203,8 +211,10 @@ class VEQ3D_Solver:
         G_rho = dP - sqrt_g * (Jt_sup * Bz_sup - Jz_sup * Bt_sup) / self.mu_0
         rho_R, rho_Z = Zt/det_safe, -Rt/det_safe
         th_R, th_Z = -Zr/det_safe, Rr/det_safe
-        GR = (rho_R * G_rho + (Jr_phys / (2 * np.pi)) * (th_R * Phip))
-        GZ = (rho_Z * G_rho + (Jr_phys / (2 * np.pi)) * (th_Z * Phip))
+        
+        # 【修复3】：加上遗漏的 Pfirsch-Schlüter 环向电流修正项 (Lt) 从而严格闭合 Galerkin 投影
+        GR = (rho_R * G_rho + (Jr_phys / (2 * np.pi)) * (th_R * (Phip + Lt)))
+        GZ = (rho_Z * G_rho + (Jr_phys / (2 * np.pi)) * (th_Z * (Phip + Lt)))
 
         # 5. 变分残差构造
         residuals = []
@@ -227,6 +237,7 @@ class VEQ3D_Solver:
             residuals.append(np.sum(sqrt_g * term * self.weights_3d) * dV)
 
         for m, n in [(1, -1), (1, 0), (1, 1)]:
+            # 【修复2C】：残差检验函数的宇称也要同步
             test_function = L_fac * np.sin(m * self.TH - n * self.ZE)
             res_L = np.sum(sqrt_g * Jr_phys * test_function * self.weights_3d) * dV
             residuals.append(res_L)
@@ -276,7 +287,7 @@ class VEQ3D_Solver:
         for i, name in enumerate(core_names):
             print(f"{name:<8} | {x_core[i]:>15.8e} | {name.split('_')[0]} 的径向演化系数")
 
-        print(f"\n[3] 流函数参数 (Lambda_mn - Coefficients of rho^2(1-rho^2)):")
+        print(f"\n[3] 流函数参数 (Lambda_mn - Coefficients of rho(1-rho^2)):")
         print("-" * 60)
         lambda_modes = [("1,-1", "L_1n1_1"), ("1,0", "L_10_1"), ("1,1", "L_11_1")]
         for i, (mode, name) in enumerate(lambda_modes):
@@ -286,9 +297,19 @@ class VEQ3D_Solver:
 
     def solve(self):
         print(">>> 启动 VEQ-3D 谱精度平衡求解器 (修复手性与参数简并)...")
-        x0 = np.zeros(21); x0[15] = 0.05
-        res = least_squares(self.compute_physics, x0, method='trf', xtol=1e-11, ftol=1e-11, max_nfev=500)
+        # 由于我们取消了自动 scaling，这里的初始容差 ftol 和 xtol 需要稍微放宽或保持相对容差
+        x0 = np.zeros(21)
         
+        # 开始统计核心计算时间
+        start_time = time.time()
+        
+        res = least_squares(self.compute_physics, x0, method='trf', xtol=1e-10, ftol=1e-10, max_nfev=500)
+        
+        # 结束时间统计
+        end_time = time.time()
+        compute_time = end_time - start_time
+        
+        print(f">>> 核心物理平衡计算耗时: {compute_time:.4f} 秒")
         print(f">>> 最终收敛范数: {np.linalg.norm(res.fun):.4e}")
         self.print_final_parameters(res.x)
         self.plot_equilibrium(res.x)
