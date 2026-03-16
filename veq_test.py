@@ -229,8 +229,8 @@ class VEQ3D_Solver:
         return D
 
     def get_profiles(self, rho):
-        # 【物理失真修复】: 降低中心压强，解除高比压带来的无解极端 Shafranov 位移
-        P_scale = 1.0e3 
+        # 【物理参数恢复】: 恢复真实高压强，让高比压的 Shafranov 位移自然涌现
+        P_scale = 1.8e4 
         P = P_scale * (rho**2 - 1)**2
         dP_drho = P_scale * 4 * rho * (rho**2 - 1)
         Phi_prime = 2 * rho * self.Phi_a
@@ -394,7 +394,8 @@ class VEQ3D_Solver:
         Zz = vz + kz * rho * a * np.sin(thZ) + k * rho * az * np.sin(thZ) + k * rho * a * np.cos(thZ) * thZ_z
 
         det_phys = Rr * Zt - Rt * Zr
-        det_safe = np.where(np.abs(det_phys) < 1e-13, -1e-13, det_phys)
+        # 【雅可比下限修复】: 正常网格 det_phys 应为正数(正比于rho)，出现极小值时截断为正的 1e-13
+        det_safe = np.where(det_phys < 1e-13, 1e-13, det_phys)
         sqrt_g = (R / self.Nt) * det_safe
         
         g_rr, g_tt = Rr**2 + Zr**2, Rt**2 + Zt**2
@@ -475,9 +476,9 @@ class VEQ3D_Solver:
             reg_penalty = x_core[idx_start:idx_end] * 1e-1
             final_res = np.concatenate([final_res, reg_penalty])
             
-        if np.any(det_phys > 1e-4):
-            # 【修复海森矩阵破坏】: 作为软约束附加到残差末尾
-            penalty_res = np.where(det_phys > 1e-4, 100.0 * (det_phys - 1e-4), 0.0).flatten()
+        # 【致命 Bug 彻底修复】: 仅对网格交叉翻转（det_phys 极小或为负数）的情况施加加法惩罚软约束
+        if np.any(det_phys < 1e-4):
+            penalty_res = np.where(det_phys < 1e-4, 100.0 * (1e-4 - det_phys), 0.0).flatten()
             final_res = np.concatenate([final_res, penalty_res])  
             
         return final_res
@@ -603,4 +604,4 @@ class VEQ3D_Solver:
         plt.tight_layout(); plt.show()
 
 if __name__ == "__main__":
-    VEQ3D_Solver().solve(target_M=1, target_N=2, target_L=2)
+    VEQ3D_Solver().solve(target_M=0, target_N=1, target_L=1)
