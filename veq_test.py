@@ -5,18 +5,15 @@ import time
 
 class VEQ3D_Solver:
     def __init__(self):
-        # =========================================================
-        # [核心可调参数区] 自由调节极向 M、环向 N 与径向 L 阶数
-        # =========================================================
-        self.M_pol = 0                # 极向扰动阶数 (Poloidal Mode)
-        self.N_tor = 1                # 环向展开阶数 (Toroidal Mode)
-        self.L_rad = 1               # 径向基底展开阶数 (引入平移切比雪夫多项式)
-        # =========================================================
+        # 初始默认参数 (实际目标求解阶数通过 solve() 函数指定)
+        self.M_pol = 0                
+        self.N_tor = 1                
+        self.L_rad = 1               
         
         # 1. 物理常数 (严格回归 SI 单位制以对齐 DESC)
-        self.Nt = 19                  # 周期数
-        self.Phi_a = 1.0             # 总环向磁通 (Wb)
-        self.mu_0 = 4 * np.pi * 1e-7 # 真空磁导率 (H/m)
+        self.Nt = 19                  
+        self.Phi_a = 1.0             
+        self.mu_0 = 4 * np.pi * 1e-7 
         
         # 2. 离散化网格 (Nr=24, 角向网格采用 2^n 以优化 FFT)
         self.Nr = 24                  
@@ -33,9 +30,6 @@ class VEQ3D_Solver:
         
         self.D_matrix = self._get_spectral_diff_matrix(self.rho)
         
-        self.k_th = np.fft.fftfreq(self.Nt_grid, d=1.0/self.Nt_grid)[None, :, None]
-        self.k_ze = np.fft.fftfreq(self.Nz_grid, d=1.0/self.Nz_grid)[None, None, :]
-        
         self.theta = np.linspace(0, 2*np.pi, self.Nt_grid, endpoint=False)
         self.zeta = np.linspace(0, 2*np.pi, self.Nz_grid, endpoint=False)
         self.dtheta = 2 * np.pi / self.Nt_grid
@@ -44,11 +38,14 @@ class VEQ3D_Solver:
         self.RHO, self.TH, self.ZE = np.meshgrid(self.rho, self.theta, self.zeta, indexing='ij')
         self.weights_3d = self.rho_weights[:, None, None]
 
+        # 【性能优化】: 构造等效于精确 FFT 求导的矩阵算子，用于消灭运行时 FFT
+        self._build_spectral_matrices()
+        
         # 动态构建全空间基底函数
         self._build_basis_matrices()
 
         self.p_edge = None
-        # 执行边界拟合
+        # 执行初始阶段的边界拟合
         self.fit_boundary()
         
         # 自适应预条件权重
@@ -73,10 +70,17 @@ class VEQ3D_Solver:
                 self.lambda_modes.append((m, n))
         self.len_lam = len(self.lambda_modes)
         
-        # [核心高维升级]: 核心参数被 L_rad 倍增，几何常数保持不变
         self.num_geom_params = (6 * self.len_1d + 2 * self.len_2d) * self.L_rad
         self.num_core_params = self.num_geom_params + self.len_lam * self.L_rad
         self.num_edge_params = 2 + 6 * self.len_1d + 2 * self.len_2d
+
+    def _build_spectral_matrices(self):
+        """利用单位阵的逆傅里叶变换提取精确的纯实数谱导数矩阵算子"""
+        I_th = np.eye(self.Nt_grid)
+        self.D_th_matrix = np.real(np.fft.ifft(1j * np.fft.fftfreq(self.Nt_grid, d=1.0/self.Nt_grid)[:, None] * np.fft.fft(I_th, axis=0), axis=0))
+        
+        I_ze = np.eye(self.Nz_grid)
+        self.D_ze_matrix = np.real(np.fft.ifft(1j * np.fft.fftfreq(self.Nz_grid, d=1.0/self.Nz_grid)[:, None] * np.fft.fft(I_ze, axis=0), axis=0))
 
     def _build_basis_matrices(self):
         """预计算各维度的傅里叶基底及其解析导数"""
@@ -121,6 +125,70 @@ class VEQ3D_Solver:
             return c
         return get(self.len_1d), get(self.len_1d), get(self.len_1d), get(self.len_1d), get(self.len_1d), get(self.len_1d), get(self.len_2d), get(self.len_2d), get(self.len_lam)
 
+    def _upgrade_edge_params(self, old_edge, m_old, m_new):
+        """【修复】: 平滑升阶算法 —— 将边界包络参数阵列补充高维零分量"""
+        if m_old == m_new: return old_edge.copy()
+        
+        base_len = 2 + 6 * self.len_1d
+        base = old_edge[:base_len]
+        
+        len_2d_old = 2 * m_old * (2 * self.N_tor + 1)
+        len_2d_new = 2 * m_new * (2 * self.N_tor + 1)
+        
+        tR_old = old_edge[base_len : base_len + len_2d_old] if len_2d_old > 0 else np.array([])
+        tZ_old = old_edge[base_len + len_2d_old : base_len + 2 * len_2d_old] if len_2d_old > 0 else np.array([])
+        
+        len_add = len_2d_new - len_2d_old
+        tR_new = np.concatenate([tR_old, np.zeros(len_add)]) if len_add > 0 else tR_old.copy()
+        tZ_new = np.concatenate([tZ_old, np.zeros(len_add)]) if len_add > 0 else tZ_old.copy()
+        
+        return np.concatenate([base, tR_new, tZ_new])
+
+    def _upgrade_core_params(self, old_params, m_old, m_new):
+        """【平滑升阶算法】将极小值解零填充扩展至更高维度阵列"""
+        if m_old == m_new: return old_params.copy()
+        
+        # 预计算旧维度的长度特征
+        len_2d_old = 2 * m_old * (2 * self.N_tor + 1)
+        len_lam_old = self.N_tor + (m_old + 1) * (2 * self.N_tor + 1)
+        
+        idx = 0
+        def get_old(L):
+            nonlocal idx
+            c = old_params[idx:idx+L*self.L_rad].reshape(self.L_rad, L)
+            idx += L * self.L_rad
+            return c
+            
+        c0R = get_old(self.len_1d)
+        c0Z = get_old(self.len_1d)
+        h = get_old(self.len_1d)
+        v = get_old(self.len_1d)
+        k = get_old(self.len_1d)
+        a = get_old(self.len_1d)
+        tR_old = get_old(len_2d_old)
+        tZ_old = get_old(len_2d_old)
+        lam_old = get_old(len_lam_old)
+        
+        # 获取新空间的预留槽位
+        len_2d_new = 2 * m_new * (2 * self.N_tor + 1)
+        len_lam_new = self.N_tor + (m_new + 1) * (2 * self.N_tor + 1)
+        
+        tR_new = np.zeros((self.L_rad, len_2d_new))
+        tZ_new = np.zeros((self.L_rad, len_2d_new))
+        lam_new = np.zeros((self.L_rad, len_lam_new))
+        
+        # 原封不动注入先验收敛特征
+        if len_2d_old > 0:
+            tR_new[:, :len_2d_old] = tR_old
+            tZ_new[:, :len_2d_old] = tZ_old
+        lam_new[:, :len_lam_old] = lam_old
+        
+        # 以正确的展平次序输出
+        return np.concatenate([
+            c0R.flatten(), c0Z.flatten(), h.flatten(), v.flatten(), k.flatten(), a.flatten(),
+            tR_new.flatten(), tZ_new.flatten(), lam_new.flatten()
+        ])
+
     def _get_chebyshev_nodes_and_weights(self, N):
         k = np.arange(N)
         theta = (2 * (N - 1 - k) + 1) * np.pi / (2 * N)
@@ -146,8 +214,6 @@ class VEQ3D_Solver:
         return D
 
     def _initialize_scaling(self):
-        print(f">>> 参数体系已重构: 空间维度 (M={self.M_pol}, N={self.N_tor}, L={self.L_rad})")
-        print(f">>> 总优化参数量: {self.num_core_params} 个 (几何: {self.num_geom_params}, 流函数: {self.len_lam * self.L_rad})")
         self.res_scales = np.ones(self.num_core_params)
         self.res_scales[:self.num_geom_params] = 1e5
         self.res_scales[self.num_geom_params:] = 1e6
@@ -164,8 +230,8 @@ class VEQ3D_Solver:
     def compute_psi(self, rho):
         return self.Phi_a * (rho**2 + 0.75 * rho**4)
 
-    def fit_boundary(self):
-        print(f">>> 正在拟合目标边界位形...")
+    def fit_boundary(self, use_existing_as_guess=False):
+        print(f">>> 正在预拟合目标边界位形(LCFS)...")
         TH_F, ZE_F = self.TH[0], self.ZE[0]
         R_target = 10 - np.cos(TH_F) - 0.3 * np.cos(TH_F + ZE_F)
         Z_target = np.sin(TH_F) - 0.3 * np.sin(TH_F + ZE_F)
@@ -194,24 +260,23 @@ class VEQ3D_Solver:
             return np.concatenate([res_geom, res_reg])
             
         p0 = np.zeros(self.num_edge_params)
-        p0[0] = 10.0 
-        p0[2] = np.pi 
-        p0[2 + 4 * self.len_1d] = 1.0 
-        p0[2 + 5 * self.len_1d] = 1.0 
+        # 【修复】：升阶后如果是复用历史边界常数阵列，直接覆盖作为起点
+        if use_existing_as_guess and self.p_edge is not None and len(self.p_edge) == self.num_edge_params:
+            p0 = self.p_edge.copy()
+        else:
+            p0[0] = 10.0 
+            p0[2] = np.pi 
+            p0[2 + 4 * self.len_1d] = 1.0 
+            p0[2 + 5 * self.len_1d] = 1.0 
         
         res = least_squares(boundary_residuals, p0, method='trf', ftol=1e-12)
         self.p_edge = res.x
-        print(f"    边界预拟合完成，Cost: {res.cost:.4e}")
+        print(f"    边界 LCFS 投影完毕，极小 Cost: {res.cost:.4e}")
 
     def compute_geometry(self, x_core, rho, theta, zeta):
         rho, theta, zeta = np.atleast_1d(rho), np.atleast_1d(theta), np.atleast_1d(zeta)
-        
-        # 建立广播基础形状，防止 numpy 原地累加 (+=) 时产生形状不匹配错误
         base_grid = rho + theta + zeta
         
-        # ==============================================================================
-        # [核心替换]：引入平移切比雪夫多项式 T_l(x) 构造真正的正交径向基底
-        # ==============================================================================
         x = 2.0 * rho**2 - 1.0
         T = np.zeros((self.L_rad,) + x.shape)
         if self.L_rad > 0: T[0] = 1.0
@@ -219,15 +284,15 @@ class VEQ3D_Solver:
         for l in range(2, self.L_rad):
             T[l] = 2.0 * x * T[l-1] - T[l-2]
             
-        fac_rad = (1.0 - rho**2) * T  # u_l(rho)
-        L_fac_rad = rho * fac_rad     # 流函数需要额外乘 rho 确保中心解析性
+        fac_rad = (1.0 - rho**2) * T  
+        L_fac_rad = rho * fac_rad     
         
         e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = self.unpack_edge()
         c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = self.unpack_core(x_core)
         
         def ev_1d(c_e, c_c):
             val = c_e[0] + np.tensordot(c_c[:, 0], fac_rad, axes=(0, 0))
-            val = val + np.zeros_like(base_grid)  # 安全扩张到目标网格大小
+            val = val + np.zeros_like(base_grid)  
             idx = 1
             for n in range(1, self.N_tor + 1):
                 c_n = c_e[idx]   + np.tensordot(c_c[:, idx],   fac_rad, axes=(0, 0))
@@ -261,11 +326,8 @@ class VEQ3D_Solver:
 
     def compute_physics(self, x_core, apply_scaling=True):
         rho, theta, zeta = self.RHO, self.TH, self.ZE
-        
         rho_1d = self.rho
-        # ==============================================================================
-        # [核心替换]：计算切比雪夫多项式 T_l(x) 及其关于 \rho 的严格解析导数
-        # ==============================================================================
+        
         x = 2.0 * rho_1d**2 - 1.0
         T = np.zeros((self.L_rad,) + x.shape)
         dTdx = np.zeros((self.L_rad,) + x.shape)
@@ -281,15 +343,15 @@ class VEQ3D_Solver:
             dTdx[l] = 2.0 * T[l-1] + 2.0 * x * dTdx[l-1] - dTdx[l-2]
             
         fac_rad = (1.0 - rho_1d**2) * T
-        # 严格链式求导公式：u_l'(rho) = -2*rho*T_l + 4*rho*(1-rho^2)*T_l'(x)
         dfac_rad = -2.0 * rho_1d * T + 4.0 * rho_1d * (1.0 - rho_1d**2) * dTdx
         L_fac_rad = rho_1d[None, :] * fac_rad
         
         e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = self.unpack_edge()
         c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = self.unpack_core(x_core)
         
-        def spectral_grad_th(f): return np.real(np.fft.ifft(1j * self.k_th * np.fft.fft(f, axis=1), axis=1))
-        def spectral_grad_ze(f): return np.real(np.fft.ifft(1j * self.k_ze * np.fft.fft(f, axis=2), axis=2))
+        # 【性能优化】使用提前计算好的差分矩阵取代原生的 np.fft.fft 调用
+        def spectral_grad_th(f): return np.einsum('tj, rjz -> rtz', self.D_th_matrix, f)
+        def spectral_grad_ze(f): return np.einsum('zj, rtj -> rtz', self.D_ze_matrix, f)
 
         def eval_1d(c_e, c_c):
             core_contrib = np.sum(c_c[:, :, None, None, None] * fac_rad[:, None, :, None, None], axis=0)
@@ -371,27 +433,48 @@ class VEQ3D_Solver:
         GR = (rho_R * G_rho + (Jr_phys / (2 * np.pi)) * (th_R * (Phip + Lt)))
         GZ = (rho_Z * G_rho + (Jr_phys / (2 * np.pi)) * (th_Z * (Phip + Lt)))
 
-        residuals = []
-        dV = self.dtheta * self.dzeta
-        def integrate(term): return np.sum(sqrt_g * term * self.weights_3d) * dV
+        # ==============================================================================
+        # 【性能优化】: 将数以千计的 for 循环串行算子更改为爱因斯坦求和(einsum)全张量映射
+        # ==============================================================================
+        vol_element = sqrt_g * self.weights_3d * self.dtheta * self.dzeta # shape: (Nr, Nt, Nz)
+        b1d = self.basis_1d_val[:, 0, 0, :]   # shape: (len_1d, Nz)
+        b2d = self.basis_2d_val[:, 0, :, :]   # shape: (len_2d, Nt, Nz)
+        blam = self.basis_lam_val[:, 0, :, :] # shape: (len_lam, Nt, Nz)
         
-        for L_idx in range(self.L_rad):
-            test_fac = fac_rad[L_idx, :, None, None]
-            for i in range(self.len_1d): residuals.append(integrate( GR * (-rho * a * np.sin(thR) * test_fac * self.basis_1d_val[i]) ))
-            for i in range(self.len_1d): residuals.append(integrate( GZ * (k * rho * a * np.cos(thZ) * test_fac * self.basis_1d_val[i]) ))
-            for i in range(self.len_1d): residuals.append(integrate( GR * (test_fac * self.basis_1d_val[i]) ))
-            for i in range(self.len_1d): residuals.append(integrate( GZ * (test_fac * self.basis_1d_val[i]) ))
-            for i in range(self.len_1d): residuals.append(integrate( GZ * (test_fac * rho * a * np.sin(thZ) * self.basis_1d_val[i]) ))
-            for i in range(self.len_1d): residuals.append(integrate( GR * (rho * np.cos(thR) * test_fac * self.basis_1d_val[i]) + GZ * (k * rho * np.sin(thZ) * test_fac * self.basis_1d_val[i]) ))
-                
-            for i in range(self.len_2d): residuals.append(integrate( GR * (-rho * a * np.sin(thR) * test_fac * self.basis_2d_val[i]) ))
-            for i in range(self.len_2d): residuals.append(integrate( GZ * (k * rho * a * np.cos(thZ) * test_fac * self.basis_2d_val[i]) ))
-                
-        for L_idx in range(self.L_rad):
-            test_L_fac = L_fac_rad[L_idx, :, None, None]
-            for i in range(self.len_lam): residuals.append(integrate( Jr_phys * (test_L_fac * self.basis_lam_val[i]) ))
+        # 构建广义基向量残差核函数
+        term_R_tR = GR * (-rho * a * np.sin(thR)) * vol_element
+        term_Z_tZ = GZ * (k * rho * a * np.cos(thZ)) * vol_element
+        term_R_c0R = GR * vol_element
+        term_Z_c0Z = GZ * vol_element
+        term_Z_k = GZ * (rho * a * np.sin(thZ)) * vol_element
+        term_R_Z_a = (GR * rho * np.cos(thR) + GZ * k * rho * np.sin(thZ)) * vol_element
+        
+        # 利用张量内积直接压缩空间三个自由度
+        res_1 = np.einsum('rtz, lr, iz -> li', term_R_tR, fac_rad, b1d)
+        res_2 = np.einsum('rtz, lr, iz -> li', term_Z_tZ, fac_rad, b1d)
+        res_3 = np.einsum('rtz, lr, iz -> li', term_R_c0R, fac_rad, b1d)
+        res_4 = np.einsum('rtz, lr, iz -> li', term_Z_c0Z, fac_rad, b1d)
+        res_5 = np.einsum('rtz, lr, iz -> li', term_Z_k, fac_rad, b1d)
+        res_6 = np.einsum('rtz, lr, iz -> li', term_R_Z_a, fac_rad, b1d)
+        
+        if self.len_2d > 0:
+            res_7 = np.einsum('rtz, lr, itz -> li', term_R_tR, fac_rad, b2d)
+            res_8 = np.einsum('rtz, lr, itz -> li', term_Z_tZ, fac_rad, b2d)
             
-        final_res = np.array(residuals)
+        # 根据原始尺度定义，交织合并以完美挂接缩放预条件器 res_scales
+        residuals_list = []
+        for L_idx in range(self.L_rad):
+            residuals_list.extend([res_1[L_idx], res_2[L_idx], res_3[L_idx], res_4[L_idx], res_5[L_idx], res_6[L_idx]])
+            if self.len_2d > 0:
+                residuals_list.extend([res_7[L_idx], res_8[L_idx]])
+                
+        if self.len_lam > 0:
+            res_lam = np.einsum('rtz, lr, itz -> li', Jr_phys * vol_element, L_fac_rad, blam)
+            for L_idx in range(self.L_rad):
+                residuals_list.append(res_lam[L_idx])
+                
+        final_res = np.concatenate(residuals_list)
+        
         if apply_scaling: 
             final_res = final_res / self.res_scales
             
@@ -454,16 +537,55 @@ class VEQ3D_Solver:
             print(L_str)
         print("="*110 + "\n")
 
-    def solve(self):
-        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (修复手性与参数简并)...")
-        x0 = np.zeros(self.num_core_params)
+    def solve(self, target_M=1, target_N=1, target_L=1):
+        """核心求解调度器: 强制引入 M 从 0 至高的序列化热启动"""
+        print(f">>> 启动 VEQ-3D 谱精度平衡求解器 (优化重构: 张量映射 + 矩阵谱导数) ...")
         
+        # 降维制备：首先求解系统无扰动主轴对称特解
+        self.M_pol = 0
+        self.N_tor = target_N
+        self.L_rad = target_L
+        self._setup_modes()
+        self._initialize_scaling()
+        self._build_basis_matrices()
+        
+        # 【修复点】：由于 target_N 可能发生改变，必须在此刻重新执行对应高维度的 LCFS 边界包络拟合
+        self.fit_boundary(use_existing_as_guess=False)
+        
+        print(f"\n[第 1 阶段] 求解零阶骨架包络平衡 (M=0, N={self.N_tor}, L={self.L_rad})")
+        x_opt = np.zeros(self.num_core_params)
         start_time = time.time()
-        res = least_squares(self.compute_physics, x0, method='trf', xtol=1e-10, ftol=1e-10, max_nfev=1500)
-        end_time = time.time()
         
-        print(f">>> 核心物理平衡计算耗时: {end_time - start_time:.4f} 秒")
-        print(f">>> 最终收敛范数: {np.linalg.norm(res.fun):.4e}")
+        res = least_squares(self.compute_physics, x_opt, method='trf', xtol=1e-10, ftol=1e-10, max_nfev=1500)
+        print(f"    基础场求解完成! 耗时: {time.time() - start_time:.4f} s | 最终残差范数: {np.linalg.norm(res.fun):.4e}")
+
+        # 谱升阶：平滑展开至目标高维度
+        for m in range(1, target_M + 1):
+            print(f"\n[第 {m + 1} 阶段] 维度注入，升阶向至 M={m}...")
+            old_params = res.x
+            
+            # 【修复点 1】：同步对外部强加边界常量执行升维补零操作
+            self.p_edge = self._upgrade_edge_params(self.p_edge, m_old=m-1, m_new=m)
+            
+            # 拓扑扩展当前环境参数量
+            self.M_pol = m
+            self._setup_modes()
+            self._initialize_scaling()
+            self._build_basis_matrices()
+            
+            # 【修复点 2】：利用新的包络维度去更新拟合含高维特性的极精确 LCFS 边界
+            self.fit_boundary(use_existing_as_guess=True)
+            
+            # 使用旧场态特征值对高阶阵列进行补零初始化 (极大抑制收敛漂移现象)
+            new_x0 = self._upgrade_core_params(old_params, m_old=m-1, m_new=m)
+            
+            step_start = time.time()
+            res = least_squares(self.compute_physics, new_x0, method='trf', xtol=1e-10, ftol=1e-10, max_nfev=1500)
+            print(f"    当前阶系解算完成! 耗时: {time.time() - step_start:.4f} s | 最终残差范数: {np.linalg.norm(res.fun):.4e}")
+
+        total_time = time.time() - start_time
+        print(f"\n>>> [完成] 全部物理场态构建用时: {total_time:.4f} s")
+        
         self.print_final_parameters(res.x)
         self.plot_equilibrium(res.x)
         return res.x
@@ -495,4 +617,5 @@ class VEQ3D_Solver:
         plt.tight_layout(); plt.show()
 
 if __name__ == "__main__":
-    VEQ3D_Solver().solve()
+    # 调用此接口将自动进行从 M=0 到 M=1 的两级自动平滑映射迭代
+    VEQ3D_Solver().solve(target_M=1, target_N=2, target_L=2)
