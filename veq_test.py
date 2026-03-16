@@ -237,8 +237,10 @@ class VEQ3D_Solver:
         self.res_scales[self.num_geom_params:] = 1e6
 
     def get_profiles(self, rho):
-        # 【物理参数恢复】: 恢复真实高压强，让高比压的 Shafranov 位移自然涌现
-        P_scale = 1.8e4 
+        # 引入动态乘子，默认为 1.0 (满载)
+        beta_mult = getattr(self, 'beta_mult', 1.0)
+        P_scale = 1.8e4 * beta_mult
+        
         P = P_scale * (rho**2 - 1)**2
         dP_drho = P_scale * 4 * rho * (rho**2 - 1)
         Phi_prime = 2 * rho * self.Phi_a
@@ -403,8 +405,8 @@ class VEQ3D_Solver:
         Zz = vz + kz * rho * a * np.sin(thZ) + k * rho * az * np.sin(thZ) + k * rho * a * np.cos(thZ) * thZ_z
 
         det_phys = Rr * Zt - Rt * Zr
-        # 【修复1】: 放宽安全底线，防止由于极小值导致 1/det_safe 导数爆炸
-        det_safe = np.where(det_phys < 1e-4, 1e-4, det_phys)
+        # 【核心修复1】：仅做极小值除零保护，绝不抹杀负值（翻转），确保梯度(雅可比)能持续回传！
+        det_safe = np.where(np.abs(det_phys) < 1e-12, 1e-12 * np.sign(det_phys + 1e-16), det_phys)
         sqrt_g = (R / self.Nt) * det_safe
         
         g_rr, g_tt = Rr**2 + Zr**2, Rt**2 + Zt**2
@@ -477,7 +479,6 @@ class VEQ3D_Solver:
                 
         final_res = np.concatenate(residuals_list)
         
-        # 【修复2】: 必须恢复量级预条件缩放！否则几何形变(Shafranov位移)会被优化器直接无视
         if apply_scaling: 
             final_res = final_res / self.res_scales
             
@@ -487,11 +488,10 @@ class VEQ3D_Solver:
             reg_penalty = x_core[idx_start:idx_end] * 1e-1
             final_res = np.concatenate([final_res, reg_penalty])
             
-        # 【修复3】: 将惩罚项降维为 1 个标量，并使用 np.append追加。
-        # 这样无论网格是否交叉，返回数组的长度永远只增加 1 个单位，完美兼容 least_squares！
-        # 100.0 是极强的斥力，能在网格即将交叉时狠狠推开优化器
-        grid_penalty = np.sum(np.where(det_phys < 1e-4, 100.0 * (1e-4 - det_phys), 0.0))
-        final_res = np.append(final_res, grid_penalty)
+        # 【核心修复2】：追加平滑(二次方)的定长屏障阵列 (Barrier Array)
+        # 无论是否交叉，数组长度恒定。在濒临交叉( < 1e-2 )时产生强烈的平滑反推梯度
+        grid_barrier = np.where(det_phys < 1e-2, 1e5 * (1e-2 - det_phys)**2, 0.0).flatten()
+        final_res = np.concatenate([final_res, grid_barrier])
             
         return final_res
 
@@ -540,6 +540,16 @@ class VEQ3D_Solver:
         for i, (m, n) in enumerate(self.lambda_modes):
             L_str = f"L_{m}_{n:<12} | {'-- Null --':>25} | " + " | ".join([f"{c_lam[L, i]:>22.8e}" for L in range(self.L_rad)])
             print(L_str)
+            
+        # 【新增功能】：计算并输出磁轴空间坐标位置 (rho=0 处)
+        print("-" * 110)
+        print(">>> 磁轴 (Magnetic Axis) 几何位置 (rho = 0.0):")
+        test_zetas = [0, np.pi/2, np.pi, 3*np.pi/2]
+        for zv in test_zetas:
+            R_axis, Z_axis = self.compute_geometry(x_core, 0.0, 0.0, zv)[:2]
+            shift = R_axis[0] - edge_R0  # 计算相对于几何大半径 R0 的水平偏移量
+            print(f"    zeta = {zv:>6.3f} rad:  R_axis = {R_axis[0]:>10.5f} m,  Z_axis = {Z_axis[0]:>10.5f} m  |  Shafranov 水平位移: {shift:>8.5f} m")
+            
         print("="*110 + "\n")
 
     def solve(self, target_M=1, target_N=1, target_L=1):
@@ -559,10 +569,18 @@ class VEQ3D_Solver:
         self.fit_boundary(use_existing_as_guess=False)
         
         print(f"\n[第 1 阶段] 求解零阶骨架包络平衡 (M=0, N={self.N_tor}, L={self.L_rad})")
-        x_opt = np.zeros(self.num_core_params)
-        start_time = time.time()
         
-        res = least_squares(self.compute_physics, x_opt, method='trf', xtol=1e-10, ftol=1e-10, max_nfev=1500)
+        # 【核心修复3】：执行 Beta-Ramping (压力延续法)
+        print("    >> 执行 Beta-Ramping (注入 20% 压强预热) 防止非线性震荡崩溃...")
+        self.beta_mult = 0.2
+        x_opt = np.zeros(self.num_core_params)
+        res_pre = least_squares(self.compute_physics, x_opt, method='trf', xtol=1e-8, ftol=1e-8, max_nfev=500)
+        
+        print("    >> 注入 100% 真实高压强，冲刺高比压 Shafranov 平衡态...")
+        self.beta_mult = 1.0  # 恢复满载压强
+        start_time = time.time()
+        # 将上一步 20% 压强下的解 res_pre.x 作为热启动初始猜测值
+        res = least_squares(self.compute_physics, res_pre.x, method='trf', xtol=1e-10, ftol=1e-10, max_nfev=1500)
         print(f"    基础场求解完成! 耗时: {time.time() - start_time:.4f} s | 最终残差范数: {np.linalg.norm(res.fun):.4e}")
 
         for m in range(1, target_M + 1):
@@ -617,9 +635,14 @@ class VEQ3D_Solver:
             
             rl_e, zl_e = self.compute_geometry(x_core, 1.0, np.linspace(0, 2*np.pi, 100), zv)[:2]
             ax.plot(rl_e, zl_e, color='#FFD700', lw=2.0, label='Solved Boundary')
+            
+            # 【新增功能】：在截面可视化图表中高亮标记出物理磁轴点
+            r_axis, z_axis = self.compute_geometry(x_core, 0.0, 0.0, zv)[:2]
+            ax.plot(r_axis[0], z_axis[0], '*', color='#00FF00', markersize=12, markeredgecolor='black', label='Magnetic Axis')
+            
             ax.set_aspect('equal'); ax.set_title(f'Toroidal Angle $\zeta={zv:.2f}$'); 
             if i == 0: ax.legend(loc='upper right', fontsize='xx-small')
         plt.tight_layout(); plt.show()
 
 if __name__ == "__main__":
-    VEQ3D_Solver().solve(target_M=0, target_N=1, target_L=1)
+    VEQ3D_Solver().solve(target_M=1, target_N=2, target_L=2)
