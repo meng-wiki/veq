@@ -229,12 +229,12 @@ class VEQ3D_Solver:
         return D
 
     def _initialize_scaling(self):
-        """【修复】: 恢复被误删的预条件缩放器初始化方法"""
+        """【修复1】: 降低预条件缩放比例，防止优化器过早判定假收敛"""
         self.res_scales = np.ones(self.num_core_params)
-        # 几何参数对应的残差放缩量级
-        self.res_scales[:self.num_geom_params] = 1e5
-        # 磁流函数(Lambda)对应的残差放缩量级
-        self.res_scales[self.num_geom_params:] = 1e6
+        # 几何参数对应的残差放缩量级从 1e5 降至 1e2
+        self.res_scales[:self.num_geom_params] = 1e2
+        # 磁流函数(Lambda)对应的残差放缩量级从 1e6 降至 1e3
+        self.res_scales[self.num_geom_params:] = 1e3
 
     def get_profiles(self, rho):
         # 引入动态乘子，默认为 1.0 (满载)
@@ -405,8 +405,9 @@ class VEQ3D_Solver:
         Zz = vz + kz * rho * a * np.sin(thZ) + k * rho * az * np.sin(thZ) + k * rho * a * np.cos(thZ) * thZ_z
 
         det_phys = Rr * Zt - Rt * Zr
-        # 【核心修复1】：仅做极小值除零保护，绝不抹杀负值（翻转），确保梯度(雅可比)能持续回传！
-        det_safe = np.where(np.abs(det_phys) < 1e-12, 1e-12 * np.sign(det_phys + 1e-16), det_phys)
+        # 【修复2】: 安全阈值设定为 1e-5。
+        # 完美避开真实磁轴的自然极小值(约 1e-3)，强制正数截断防止洛伦兹力变号反转！
+        det_safe = np.where(det_phys < 1e-5, 1e-5, det_phys)
         sqrt_g = (R / self.Nt) * det_safe
         
         g_rr, g_tt = Rr**2 + Zr**2, Rt**2 + Zt**2
@@ -488,9 +489,9 @@ class VEQ3D_Solver:
             reg_penalty = x_core[idx_start:idx_end] * 1e-1
             final_res = np.concatenate([final_res, reg_penalty])
             
-        # 【核心修复2】：追加平滑(二次方)的定长屏障阵列 (Barrier Array)
-        # 无论是否交叉，数组长度恒定。在濒临交叉( < 1e-2 )时产生强烈的平滑反推梯度
-        grid_barrier = np.where(det_phys < 1e-2, 1e5 * (1e-2 - det_phys)**2, 0.0).flatten()
+        # 【修复3】：将屏障触发阈值降至 1e-5！
+        # 释放对正常磁轴的误伤，仅在网格真正濒临交叉时才爆发强大推力
+        grid_barrier = np.where(det_phys < 1e-5, 1e6 * (1e-5 - det_phys)**2, 0.0).flatten()
         final_res = np.concatenate([final_res, grid_barrier])
             
         return final_res
