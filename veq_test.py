@@ -228,6 +228,14 @@ class VEQ3D_Solver:
             D[i, i] = -np.sum(D[i, :])
         return D
 
+    def _initialize_scaling(self):
+        """【修复】: 恢复被误删的预条件缩放器初始化方法"""
+        self.res_scales = np.ones(self.num_core_params)
+        # 几何参数对应的残差放缩量级
+        self.res_scales[:self.num_geom_params] = 1e5
+        # 磁流函数(Lambda)对应的残差放缩量级
+        self.res_scales[self.num_geom_params:] = 1e6
+
     def get_profiles(self, rho):
         # 【物理参数恢复】: 恢复真实高压强，让高比压的 Shafranov 位移自然涌现
         P_scale = 1.8e4 
@@ -334,7 +342,8 @@ class VEQ3D_Solver:
             
         return R, Z, thR, thZ, a, k, lam
 
-    def compute_physics(self, x_core):
+    # 【修复报错】: 在参数列表中补回 apply_scaling=True 
+    def compute_physics(self, x_core, apply_scaling=True):
         rho, theta, zeta = self.RHO, self.TH, self.ZE
         
         # 直接使用预计算的静态矩阵，极大降低目标函数计算耗时
@@ -394,8 +403,8 @@ class VEQ3D_Solver:
         Zz = vz + kz * rho * a * np.sin(thZ) + k * rho * az * np.sin(thZ) + k * rho * a * np.cos(thZ) * thZ_z
 
         det_phys = Rr * Zt - Rt * Zr
-        # 【雅可比下限修复】: 正常网格 det_phys 应为正数(正比于rho)，出现极小值时截断为正的 1e-13
-        det_safe = np.where(det_phys < 1e-13, 1e-13, det_phys)
+        # 【修复1】: 放宽安全底线，防止由于极小值导致 1/det_safe 导数爆炸
+        det_safe = np.where(det_phys < 1e-4, 1e-4, det_phys)
         sqrt_g = (R / self.Nt) * det_safe
         
         g_rr, g_tt = Rr**2 + Zr**2, Rt**2 + Zt**2
@@ -468,7 +477,9 @@ class VEQ3D_Solver:
                 
         final_res = np.concatenate(residuals_list)
         
-        # 【取消假收敛欺骗】: 移除 final_res = final_res / self.res_scales
+        # 【修复2】: 必须恢复量级预条件缩放！否则几何形变(Shafranov位移)会被优化器直接无视
+        if apply_scaling: 
+            final_res = final_res / self.res_scales
             
         if self.len_2d > 0:
             idx_start = 6 * self.len_1d * self.L_rad
@@ -476,10 +487,11 @@ class VEQ3D_Solver:
             reg_penalty = x_core[idx_start:idx_end] * 1e-1
             final_res = np.concatenate([final_res, reg_penalty])
             
-        # 【致命 Bug 彻底修复】: 仅对网格交叉翻转（det_phys 极小或为负数）的情况施加加法惩罚软约束
-        if np.any(det_phys < 1e-4):
-            penalty_res = np.where(det_phys < 1e-4, 100.0 * (1e-4 - det_phys), 0.0).flatten()
-            final_res = np.concatenate([final_res, penalty_res])  
+        # 【修复3】: 将惩罚项降维为 1 个标量，并使用 np.append追加。
+        # 这样无论网格是否交叉，返回数组的长度永远只增加 1 个单位，完美兼容 least_squares！
+        # 100.0 是极强的斥力，能在网格即将交叉时狠狠推开优化器
+        grid_penalty = np.sum(np.where(det_phys < 1e-4, 100.0 * (1e-4 - det_phys), 0.0))
+        final_res = np.append(final_res, grid_penalty)
             
         return final_res
 
@@ -538,6 +550,9 @@ class VEQ3D_Solver:
         self.L_rad = target_L
         self._setup_modes()
         
+        # 【修复点1】: 第一阶段求解前，初始化量级缩放阵列
+        self._initialize_scaling()
+        
         self._build_basis_matrices()
         self._build_radial_matrices() # 更新因 L_rad 可能发生变化带来的预计算张量
         
@@ -558,6 +573,9 @@ class VEQ3D_Solver:
             
             self.M_pol = m
             self._setup_modes()
+            
+            # 【修复点2】: 升阶维度更新后，重新初始化对应高维度的缩放阵列
+            self._initialize_scaling()
             
             self._build_basis_matrices()
             self._build_radial_matrices()
