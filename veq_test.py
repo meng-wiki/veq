@@ -643,12 +643,21 @@ class VEQ3D_Solver:
                 self.update_grid(min_Nr, min_Nt, min_Nz, p_edge_guess=new_p_edge)
                 old_p_edge = self.p_edge  # 更新记录
                 
+                # =========================================================
+                # 【终极修复】新增：阶段 A 缓冲 (Phase A Buffer)
+                # 作用：让核心参数在计算成本极低的粗网格上，快速吸收和适应 N 升阶带来的边界形变冲击
+                # =========================================================
+                print(f"    -> [阶段 A 缓冲]: 粗网格吸收形变冲击 (Nr={self.Nr}, Nt={self.Nt_grid}, Nz={self.Nz_grid})")
+                res_buf = self._run_optimization(x_current, max_nfev=80, ftol=1e-3)
+                x_current = res_buf.x
+                # =========================================================
+                
             if not is_final_step:
                 med_Nr, med_Nt, med_Nz = min_Nr + 4, min_Nt + 4, min_Nz + 2
                 self.update_grid(med_Nr, med_Nt, med_Nz, p_edge_guess=old_p_edge)
                 old_p_edge = self.p_edge
                 print(f"    -> [阶段 B]: 中等网格过渡快速精炼 (Nr={self.Nr}, Nt={self.Nt_grid}, Nz={self.Nz_grid})")
-                # 为放开的新增维度赋予更宽容的评估次数
+                # 此时核心参数已经完全适应了新阶数的边界，可以轻松收敛
                 res = self._run_optimization(x_current, max_nfev=150, ftol=1e-6)
                 x_current = res.x
             else:
