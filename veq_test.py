@@ -1,3 +1,7 @@
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
 import numpy as np
 from scipy.optimize import least_squares
 import matplotlib.pyplot as plt
@@ -6,27 +10,31 @@ import time
 class VEQ3D_Solver:
     def __init__(self):
         # =========================================================
-        # [核心可调参数区] 自由调节极向 M、环向 N 与径向 L 阶数
+        # [核心可调参数区]
         # =========================================================
-        self.M_pol = 0                # 极向扰动阶数 (Poloidal Mode)
-        self.N_tor = 1                # 环向展开阶数 (Toroidal Mode)
-        self.L_rad = 1               # 径向基底展开阶数 (引入平移切比雪夫多项式)
-        # =========================================================
+        self.M_pol = 0
+        self.N_tor = 2
+        self.L_rad = 2
         
-        # 1. 物理常数 (严格回归 SI 单位制以对齐 DESC)
-        self.Nt = 19                  # 周期数
-        self.Phi_a = 1.0             # 总环向磁通 (Wb)
-        self.mu_0 = 4 * np.pi * 1e-7 # 真空磁导率 (H/m)
+        self.Nt = 19
+        self.Phi_a = 1.0
+        self.mu_0 = 4 * np.pi * 1e-7
         
-        # 2. 离散化网格 (Nr=24, 角向网格采用 2^n 以优化 FFT)
-        self.Nr = 24                  
-        self.Nt_grid = 32            
-        self.Nz_grid = 16             
+        # 目标高精度网格尺寸
+        self.target_Nr = 24
+        self.target_Nt = 32
+        self.target_Nz = 16
         
-        # 初始化动态模式信息与参数长度
         self._setup_modes()
+        self.update_grid(self.target_Nr, self.target_Nt, self.target_Nz)
+        self._initialize_scaling()
+
+    def update_grid(self, Nr, Nt_grid, Nz_grid):
+        """动态网格重构引擎：支持在优化过程中无缝切换网格分辨率"""
+        self.Nr = Nr + (Nr % 2)
+        self.Nt_grid = Nt_grid + (Nt_grid % 2)
+        self.Nz_grid = Nz_grid + (Nz_grid % 2)
         
-        # 径向积分节点: Chebyshev-Fejér 节点
         rho_nodes, self.rho_weights = self._get_chebyshev_nodes_and_weights(self.Nr)
         self.rho = 0.5 * (rho_nodes + 1)
         self.rho_weights *= 0.5
@@ -44,18 +52,10 @@ class VEQ3D_Solver:
         self.RHO, self.TH, self.ZE = np.meshgrid(self.rho, self.theta, self.zeta, indexing='ij')
         self.weights_3d = self.rho_weights[:, None, None]
 
-        # 动态构建全空间基底函数
         self._build_basis_matrices()
-
-        self.p_edge = None
-        # 执行边界拟合
         self.fit_boundary()
-        
-        # 自适应预条件权重
-        self._initialize_scaling()
 
     def _setup_modes(self):
-        """解析并计算当前 M, N, L 设定下的参数维度分布"""
         self.len_1d = 1 + 2 * self.N_tor
         
         self.modes_2d = []
@@ -73,13 +73,11 @@ class VEQ3D_Solver:
                 self.lambda_modes.append((m, n))
         self.len_lam = len(self.lambda_modes)
         
-        # [核心高维升级]: 核心参数被 L_rad 倍增，几何常数保持不变
         self.num_geom_params = (6 * self.len_1d + 2 * self.len_2d) * self.L_rad
         self.num_core_params = self.num_geom_params + self.len_lam * self.L_rad
         self.num_edge_params = 2 + 6 * self.len_1d + 2 * self.len_2d
 
     def _build_basis_matrices(self):
-        """预计算各维度的傅里叶基底及其解析导数"""
         self.basis_1d_val = np.zeros((self.len_1d, 1, 1, self.Nz_grid))
         self.basis_1d_dz  = np.zeros((self.len_1d, 1, 1, self.Nz_grid))
         self.basis_1d_val[0, 0, 0, :] = 1.0
@@ -116,7 +114,7 @@ class VEQ3D_Solver:
         idx = 0
         def get(L): 
             nonlocal idx
-            c = x_core[idx:idx+L*self.L_rad].reshape(self.L_rad, L)
+            c = x_core[idx:idx+L*self.L_rad].reshape((self.L_rad, L))
             idx += L * self.L_rad
             return c
         return get(self.len_1d), get(self.len_1d), get(self.len_1d), get(self.len_1d), get(self.len_1d), get(self.len_1d), get(self.len_2d), get(self.len_2d), get(self.len_lam)
@@ -152,20 +150,10 @@ class VEQ3D_Solver:
         self.res_scales[:self.num_geom_params] = 1e5
         self.res_scales[self.num_geom_params:] = 1e6
 
-    def get_profiles(self, rho):
-        P_scale = 1.8e4 
-        P = P_scale * (rho**2 - 1)**2
-        dP_drho = P_scale * 4 * rho * (rho**2 - 1)
-        Phi_prime = 2 * rho * self.Phi_a
-        iota = 1.0 + 1.5 * rho**2
-        psi_prime = iota * Phi_prime
-        return P, dP_drho, psi_prime, Phi_prime
-
     def compute_psi(self, rho):
         return self.Phi_a * (rho**2 + 0.75 * rho**4)
 
     def fit_boundary(self):
-        print(f">>> 正在拟合目标边界位形...")
         TH_F, ZE_F = self.TH[0], self.ZE[0]
         R_target = 10 - np.cos(TH_F) - 0.3 * np.cos(TH_F + ZE_F)
         Z_target = np.sin(TH_F) - 0.3 * np.sin(TH_F + ZE_F)
@@ -201,17 +189,330 @@ class VEQ3D_Solver:
         
         res = least_squares(boundary_residuals, p0, method='trf', ftol=1e-12)
         self.p_edge = res.x
-        print(f"    边界预拟合完成，Cost: {res.cost:.4e}")
+
+    def _build_jax_residual_fn(self):
+        RHO = jnp.array(self.RHO)
+        TH = jnp.array(self.TH)
+        ZE = jnp.array(self.ZE)
+        rho_1d = jnp.array(self.rho)
+        D_matrix = jnp.array(self.D_matrix)
+        basis_1d_val = jnp.array(self.basis_1d_val)
+        basis_1d_dz = jnp.array(self.basis_1d_dz)
+        basis_2d_val = jnp.array(self.basis_2d_val)
+        basis_2d_dth = jnp.array(self.basis_2d_dth)
+        basis_2d_dze = jnp.array(self.basis_2d_dze)
+        basis_lam_val = jnp.array(self.basis_lam_val)
+        basis_lam_dth = jnp.array(self.basis_lam_dth)
+        basis_lam_dze = jnp.array(self.basis_lam_dze)
+        k_th = jnp.array(self.k_th)
+        k_ze = jnp.array(self.k_ze)
+        weights_3d = jnp.array(self.weights_3d)
+        res_scales = jnp.array(self.res_scales)
+        p_edge = jnp.array(self.p_edge)
+        
+        L_rad = self.L_rad
+        len_1d = self.len_1d
+        len_2d = self.len_2d
+        len_lam = self.len_lam
+        Nt = self.Nt
+        mu_0 = self.mu_0
+        Phi_a = self.Phi_a
+        dtheta = self.dtheta
+        dzeta = self.dzeta
+
+        def jax_unpack_edge(p):
+            idx = 2
+            def get(L):
+                nonlocal idx
+                c = p[idx:idx+L]
+                idx += L
+                return c
+            return p[0], p[1], get(len_1d), get(len_1d), get(len_1d), get(len_1d), get(len_1d), get(len_1d), get(len_2d), get(len_2d)
+
+        def jax_unpack_core(x_core):
+            idx = 0
+            def get(L):
+                nonlocal idx
+                c = x_core[idx:idx+L*L_rad].reshape((L_rad, L))
+                idx += L * L_rad
+                return c
+            return get(len_1d), get(len_1d), get(len_1d), get(len_1d), get(len_1d), get(len_1d), get(len_2d), get(len_2d), get(len_lam)
+
+        def spectral_grad_th(f): 
+            return jnp.real(jnp.fft.ifft(1j * k_th * jnp.fft.fft(f, axis=1), axis=1))
+            
+        def spectral_grad_ze(f): 
+            return jnp.real(jnp.fft.ifft(1j * k_ze * jnp.fft.fft(f, axis=2), axis=2))
+
+        def jax_res_fn(x_core, apply_scaling=True):
+            x = 2.0 * rho_1d**2 - 1.0
+            
+            T_list = []
+            dTdx_list = []
+            if L_rad > 0:
+                T_list.append(jnp.ones_like(x))
+                dTdx_list.append(jnp.zeros_like(x))
+            if L_rad > 1:
+                T_list.append(x)
+                dTdx_list.append(jnp.ones_like(x))
+            for l in range(2, L_rad):
+                T_new = 2.0 * x * T_list[l-1] - T_list[l-2]
+                dTdx_new = 2.0 * T_list[l-1] + 2.0 * x * dTdx_list[l-1] - dTdx_list[l-2]
+                T_list.append(T_new)
+                dTdx_list.append(dTdx_new)
+                
+            T = jnp.stack(T_list, axis=0) if L_rad > 0 else jnp.empty((0,) + x.shape)
+            dTdx = jnp.stack(dTdx_list, axis=0) if L_rad > 0 else jnp.empty((0,) + x.shape)
+            
+            fac_rad = (1.0 - rho_1d**2) * T
+            dfac_rad = -2.0 * rho_1d * T + 4.0 * rho_1d * (1.0 - rho_1d**2) * dTdx
+            L_fac_rad = rho_1d[None, :] * fac_rad
+            
+            e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = jax_unpack_edge(p_edge)
+            c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = jax_unpack_core(x_core)
+
+            def eval_1d(c_e, c_c):
+                core_contrib = jnp.sum(c_c[:, :, None, None, None] * fac_rad[:, None, :, None, None], axis=0)
+                ce_eff = c_e[:, None, None, None] + core_contrib
+                val = jnp.sum(ce_eff * basis_1d_val, axis=0)
+                dz  = jnp.sum(ce_eff * basis_1d_dz,  axis=0)
+                dr_contrib = jnp.sum(c_c[:, :, None, None, None] * dfac_rad[:, None, :, None, None], axis=0)
+                dr  = jnp.sum(dr_contrib * basis_1d_val, axis=0)
+                return val, dr, dz
+
+            def eval_2d(c_e, c_c):
+                if len_2d == 0: 
+                    return 0.0, 0.0, 0.0, 0.0
+                core_contrib = jnp.sum(c_c[:, :, None, None, None] * fac_rad[:, None, :, None, None], axis=0)
+                ce_eff = c_e[:, None, None, None] + core_contrib
+                val = jnp.sum(ce_eff * basis_2d_val, axis=0)
+                dth = jnp.sum(ce_eff * basis_2d_dth, axis=0)
+                dz  = jnp.sum(ce_eff * basis_2d_dze, axis=0)
+                dr_contrib = jnp.sum(c_c[:, :, None, None, None] * dfac_rad[:, None, :, None, None], axis=0)
+                dr  = jnp.sum(dr_contrib * basis_2d_val, axis=0)
+                return val, dr, dth, dz
+
+            c0R, c0Rr, c0Rz = eval_1d(e_c0R, c_c0R)
+            c0Z, c0Zr, c0Zz = eval_1d(e_c0Z, c_c0Z)
+            h, hr, hz = eval_1d(e_h, c_h)
+            v, vr, vz = eval_1d(e_v, c_v)
+            k, kr, kz = eval_1d(e_k, c_k)
+            a, ar, az = eval_1d(e_a, c_a)
+            
+            tR, tRr, tRth, tRz = eval_2d(e_tR, c_tR)
+            tZ, tZr, tZth, tZz = eval_2d(e_tZ, c_tZ)
+            
+            thR = TH + c0R + tR
+            thZ = TH + c0Z + tZ
+            R = e_R0 + h + RHO * a * jnp.cos(thR)
+            Z = e_Z0 + v + k * RHO * a * jnp.sin(thZ)
+            
+            thR_r, thR_th, thR_z = c0Rr + tRr, 1.0 + tRth, c0Rz + tRz
+            thZ_r, thZ_th, thZ_z = c0Zr + tZr, 1.0 + tZth, c0Zz + tZz
+            
+            Rr = hr + a * jnp.cos(thR) + RHO * ar * jnp.cos(thR) - RHO * a * jnp.sin(thR) * thR_r
+            Rt = -RHO * a * jnp.sin(thR) * thR_th
+            Rz = hz + RHO * az * jnp.cos(thR) - RHO * a * jnp.sin(thR) * thR_z
+            
+            Zr = vr + kr * RHO * a * jnp.sin(thZ) + k * a * jnp.sin(thZ) + k * RHO * ar * jnp.sin(thZ) + k * RHO * a * jnp.cos(thZ) * thZ_r
+            Zt = k * RHO * a * jnp.cos(thZ) * thZ_th
+            Zz = vz + kz * RHO * a * jnp.sin(thZ) + k * RHO * az * jnp.sin(thZ) + k * RHO * a * jnp.cos(thZ) * thZ_z
+
+            det_phys = Rr * Zt - Rt * Zr
+            # 退回到最原始的 -1e-13 保护
+            det_safe = jnp.where(jnp.abs(det_phys) < 1e-13, -1e-13, det_phys)
+            
+            sqrt_g = (R / Nt) * det_safe
+            
+            g_rr, g_tt = Rr**2 + Zr**2, Rt**2 + Zt**2
+            g_zz = Rz**2 + (R/Nt)**2 + Zz**2 
+            g_rt, g_rz, g_tz = Rr*Rt+Zr*Zt, Rr*Rz+Zr*Zz, Rt*Rz+Zt*Zz
+
+            if len_lam > 0:
+                lam_eff = jnp.sum(c_lam[:, :, None, None, None] * L_fac_rad[:, None, :, None, None], axis=0) 
+                Lt = jnp.sum(lam_eff * basis_lam_dth, axis=0)
+                Lz = jnp.sum(lam_eff * basis_lam_dze, axis=0)
+            else:
+                Lt = 0.0
+                Lz = 0.0
+            
+            P_scale = 1.8e4 
+            P = P_scale * (RHO**2 - 1)**2
+            dP = P_scale * 4 * RHO * (RHO**2 - 1)
+            Phip = 2 * RHO * Phi_a
+            iota = 1.0 + 1.5 * RHO**2
+            psip = iota * Phip
+
+            Bt_sup = (psip - Lz) / (2 * jnp.pi * sqrt_g)
+            Bz_sup = (Phip + Lt) / (2 * jnp.pi * sqrt_g)
+
+            Br_sub = g_rt * Bt_sup + g_rz * Bz_sup
+            Bt_sub = g_tt * Bt_sup + g_tz * Bz_sup
+            Bz_sub = g_tz * Bt_sup + g_zz * Bz_sup
+
+            dBt_drho = jnp.tensordot(D_matrix, Bt_sub, axes=(1, 0))
+            dBz_drho = jnp.tensordot(D_matrix, Bz_sub, axes=(1, 0))
+
+            Jz_sup = (dBt_drho - spectral_grad_th(Br_sub)) / sqrt_g
+            Jt_sup = (spectral_grad_ze(Br_sub) - dBz_drho) / sqrt_g
+            Jr_sup = (spectral_grad_th(Bz_sub) - spectral_grad_ze(Bt_sub)) / sqrt_g
+
+            Jr_phys = Jr_sup / mu_0
+            G_rho = dP - sqrt_g * (Jt_sup * Bz_sup - Jz_sup * Bt_sup) / mu_0
+            rho_R, rho_Z = Zt/det_safe, -Rt/det_safe
+            th_R, th_Z = -Zr/det_safe, Rr/det_safe
+            
+            GR = (rho_R * G_rho + (Jr_phys / (2 * jnp.pi)) * (th_R * (Phip + Lt)))
+            GZ = (rho_Z * G_rho + (Jr_phys / (2 * jnp.pi)) * (th_Z * (Phip + Lt)))
+
+            dV = dtheta * dzeta
+            vol_w = sqrt_g * weights_3d * dV
+            
+            term1 = GR * (-RHO * a * jnp.sin(thR)) * vol_w
+            term2 = GZ * (k * RHO * a * jnp.cos(thZ)) * vol_w
+            term3 = GR * vol_w
+            term4 = GZ * vol_w
+            term5 = GZ * (RHO * a * jnp.sin(thZ)) * vol_w
+            term6 = (GR * RHO * jnp.cos(thR) + GZ * k * RHO * jnp.sin(thZ)) * vol_w
+            
+            basis_1d_tz = basis_1d_val[:, 0, 0, :]
+            
+            def integ_1d(term):
+                term_t = jnp.sum(term, axis=1)
+                term_tz = term_t @ basis_1d_tz.T
+                return fac_rad @ term_tz
+                
+            res1 = integ_1d(term1)
+            res2 = integ_1d(term2)
+            res3 = integ_1d(term3)
+            res4 = integ_1d(term4)
+            res5 = integ_1d(term5)
+            res6 = integ_1d(term6)
+            
+            geom_res_list = [res1, res2, res3, res4, res5, res6]
+            
+            if len_2d > 0:
+                term7 = GR * (-RHO * a * jnp.sin(thR)) * vol_w
+                term8 = GZ * (k * RHO * a * jnp.cos(thZ)) * vol_w
+                basis_2d_tz = basis_2d_val[:, 0, :, :]
+                
+                def integ_2d(term):
+                    term_tz = jnp.tensordot(term, basis_2d_tz, axes=([1, 2], [1, 2]))
+                    return fac_rad @ term_tz
+                    
+                geom_res_list.append(integ_2d(term7))
+                geom_res_list.append(integ_2d(term8))
+                
+            res_geom_concat = jnp.concatenate(geom_res_list, axis=1)
+            final_res_list = [res_geom_concat.flatten()]
+            
+            if len_lam > 0:
+                term_lam = Jr_phys * vol_w
+                basis_lam_tz = basis_lam_val[:, 0, :, :]
+                term_lam_tz = jnp.tensordot(term_lam, basis_lam_tz, axes=([1, 2], [1, 2]))
+                res_lam = L_fac_rad @ term_lam_tz
+                final_res_list.append(res_lam.flatten())
+                
+            final_res = jnp.concatenate(final_res_list)
+
+            if apply_scaling:
+                final_res = final_res / res_scales
+                
+            if len_2d > 0:
+                idx_start = 6 * len_1d * L_rad
+                idx_end = idx_start + 2 * len_2d * L_rad
+                reg_penalty = x_core[idx_start:idx_end] * 1e-1
+                final_res = jnp.concatenate([final_res, reg_penalty])
+                
+            # 退回到最简单直接的标量乘法惩罚（但保留 <1e-5 的安全阈值）
+            penalty = jnp.sum(jnp.where(det_phys < 1e-5, 100.0 * (1e-5 - det_phys)**2, 0.0))
+            final_res = final_res * (1.0 + penalty)  
+                
+            return final_res
+            
+        return jax_res_fn
+
+    def _run_optimization(self, x0, max_nfev, ftol):
+        """执行实际编译与优化过程的内联函数"""
+        jax_res_fn = self._build_jax_residual_fn()
+        
+        @jax.jit
+        def res_compiled(x):
+            return jax_res_fn(x, apply_scaling=True)
+            
+        @jax.jit
+        def jac_compiled(x):
+            return jax.jacfwd(lambda x_: jax_res_fn(x_, apply_scaling=True))(x)
+            
+        _ = res_compiled(jnp.array(x0))
+        _ = jac_compiled(jnp.array(x0))
+        
+        def fun_wrapped(x):
+            return np.array(res_compiled(jnp.array(x)))
+            
+        def jac_wrapped(x):
+            return np.array(jac_compiled(jnp.array(x)))
+
+        start_time = time.time()
+        
+        # 恢复成最朴素、最稳定的 least_squares 调用，没有任何花哨的控制参数
+        res = least_squares(
+            fun_wrapped, 
+            x0, 
+            jac=jac_wrapped, 
+            method='trf', 
+            xtol=ftol, 
+            ftol=ftol, 
+            max_nfev=max_nfev
+        )
+        end_time = time.time()
+        
+        print(f"    当前网格求解耗时: {end_time - start_time:.4f} 秒")
+        print(f"    函数评估次数: {res.nfev} 次")
+        print(f"    最终残差范数: {np.linalg.norm(res.fun):.4e}")
+        return res
+
+    def solve(self):
+        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (三级火箭加速版)...")
+        
+        # ==========================================================
+        # 阶段 1：极粗网格寻向 (Extremely Coarse Grid) - 限制步数早停
+        # ==========================================================
+        print("\n" + "="*70)
+        print(">>> [Phase 1/3]: 极粗网格冷启动寻向 (Nr=8, Nt=12, Nz=6)")
+        print("="*70)
+        self.update_grid(Nr=8, Nt_grid=12, Nz_grid=6)
+        x_guess = np.zeros(self.num_core_params)
+        
+        res_very_coarse = self._run_optimization(x_guess, max_nfev=30, ftol=1e-2)
+
+        # ==========================================================
+        # 阶段 2：中等网格精炼 (Medium Grid Refinement)
+        # ==========================================================
+        print("\n" + "="*70)
+        print(">>> [Phase 2/3]: 中等网格形貌精炼 (Nr=16, Nt=24, Nz=10)")
+        print("="*70)
+        self.update_grid(Nr=16, Nt_grid=24, Nz_grid=10)
+        
+        res_coarse = self._run_optimization(res_very_coarse.x, max_nfev=60, ftol=1e-5)
+
+        # ==========================================================
+        # 阶段 3：目标高保真网格终极收敛 (Fine Grid Final Polish)
+        # ==========================================================
+        print("\n" + "="*70)
+        print(f">>> [Phase 3/3]: 高保真网格极限收敛 (Nr={self.target_Nr}, Nt={self.target_Nt}, Nz={self.target_Nz})")
+        print("="*70)
+        self.update_grid(self.target_Nr, self.target_Nt, self.target_Nz)
+        
+        res_fine = self._run_optimization(res_coarse.x, max_nfev=1000, ftol=1e-12)
+
+        self.print_final_parameters(res_fine.x)
+        self.plot_equilibrium(res_fine.x)
+        return res_fine.x
 
     def compute_geometry(self, x_core, rho, theta, zeta):
         rho, theta, zeta = np.atleast_1d(rho), np.atleast_1d(theta), np.atleast_1d(zeta)
-        
-        # 建立广播基础形状，防止 numpy 原地累加 (+=) 时产生形状不匹配错误
         base_grid = rho + theta + zeta
-        
-        # ==============================================================================
-        # [核心替换]：引入平移切比雪夫多项式 T_l(x) 构造真正的正交径向基底
-        # ==============================================================================
         x = 2.0 * rho**2 - 1.0
         T = np.zeros((self.L_rad,) + x.shape)
         if self.L_rad > 0: T[0] = 1.0
@@ -219,15 +520,15 @@ class VEQ3D_Solver:
         for l in range(2, self.L_rad):
             T[l] = 2.0 * x * T[l-1] - T[l-2]
             
-        fac_rad = (1.0 - rho**2) * T  # u_l(rho)
-        L_fac_rad = rho * fac_rad     # 流函数需要额外乘 rho 确保中心解析性
+        fac_rad = (1.0 - rho**2) * T  
+        L_fac_rad = rho * fac_rad     
         
         e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = self.unpack_edge()
         c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = self.unpack_core(x_core)
         
         def ev_1d(c_e, c_c):
             val = c_e[0] + np.tensordot(c_c[:, 0], fac_rad, axes=(0, 0))
-            val = val + np.zeros_like(base_grid)  # 安全扩张到目标网格大小
+            val = val + np.zeros_like(base_grid)  
             idx = 1
             for n in range(1, self.N_tor + 1):
                 c_n = c_e[idx]   + np.tensordot(c_c[:, idx],   fac_rad, axes=(0, 0))
@@ -258,154 +559,6 @@ class VEQ3D_Solver:
             lam = lam + np.tensordot(c_lam[:, i], L_fac_rad, axes=(0, 0)) * np.sin(m * theta - n * zeta)
             
         return R, Z, thR, thZ, a, k, lam
-
-    def compute_physics(self, x_core, apply_scaling=True):
-        rho, theta, zeta = self.RHO, self.TH, self.ZE
-        
-        rho_1d = self.rho
-        # ==============================================================================
-        # [核心替换]：计算切比雪夫多项式 T_l(x) 及其关于 \rho 的严格解析导数
-        # ==============================================================================
-        x = 2.0 * rho_1d**2 - 1.0
-        T = np.zeros((self.L_rad,) + x.shape)
-        dTdx = np.zeros((self.L_rad,) + x.shape)
-        
-        if self.L_rad > 0: 
-            T[0] = 1.0
-            dTdx[0] = 0.0
-        if self.L_rad > 1: 
-            T[1] = x
-            dTdx[1] = 1.0
-        for l in range(2, self.L_rad): 
-            T[l] = 2.0 * x * T[l-1] - T[l-2]
-            dTdx[l] = 2.0 * T[l-1] + 2.0 * x * dTdx[l-1] - dTdx[l-2]
-            
-        fac_rad = (1.0 - rho_1d**2) * T
-        # 严格链式求导公式：u_l'(rho) = -2*rho*T_l + 4*rho*(1-rho^2)*T_l'(x)
-        dfac_rad = -2.0 * rho_1d * T + 4.0 * rho_1d * (1.0 - rho_1d**2) * dTdx
-        L_fac_rad = rho_1d[None, :] * fac_rad
-        
-        e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = self.unpack_edge()
-        c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = self.unpack_core(x_core)
-        
-        def spectral_grad_th(f): return np.real(np.fft.ifft(1j * self.k_th * np.fft.fft(f, axis=1), axis=1))
-        def spectral_grad_ze(f): return np.real(np.fft.ifft(1j * self.k_ze * np.fft.fft(f, axis=2), axis=2))
-
-        def eval_1d(c_e, c_c):
-            core_contrib = np.sum(c_c[:, :, None, None, None] * fac_rad[:, None, :, None, None], axis=0)
-            ce_eff = c_e[:, None, None, None] + core_contrib
-            val = np.sum(ce_eff * self.basis_1d_val, axis=0)
-            dz  = np.sum(ce_eff * self.basis_1d_dz,  axis=0)
-            dr_contrib = np.sum(c_c[:, :, None, None, None] * dfac_rad[:, None, :, None, None], axis=0)
-            dr  = np.sum(dr_contrib * self.basis_1d_val, axis=0)
-            return val, dr, dz
-
-        def eval_2d(c_e, c_c):
-            if self.len_2d == 0: return 0.0, 0.0, 0.0, 0.0
-            core_contrib = np.sum(c_c[:, :, None, None, None] * fac_rad[:, None, :, None, None], axis=0)
-            ce_eff = c_e[:, None, None, None] + core_contrib
-            val = np.sum(ce_eff * self.basis_2d_val, axis=0)
-            dth = np.sum(ce_eff * self.basis_2d_dth, axis=0)
-            dz  = np.sum(ce_eff * self.basis_2d_dze, axis=0)
-            dr_contrib = np.sum(c_c[:, :, None, None, None] * dfac_rad[:, None, :, None, None], axis=0)
-            dr  = np.sum(dr_contrib * self.basis_2d_val, axis=0)
-            return val, dr, dth, dz
-
-        c0R, c0Rr, c0Rz = eval_1d(e_c0R, c_c0R)
-        c0Z, c0Zr, c0Zz = eval_1d(e_c0Z, c_c0Z)
-        h, hr, hz = eval_1d(e_h, c_h)
-        v, vr, vz = eval_1d(e_v, c_v)
-        k, kr, kz = eval_1d(e_k, c_k)
-        a, ar, az = eval_1d(e_a, c_a)
-        
-        tR, tRr, tRth, tRz = eval_2d(e_tR, c_tR)
-        tZ, tZr, tZth, tZz = eval_2d(e_tZ, c_tZ)
-        
-        thR, thZ = theta + c0R + tR, theta + c0Z + tZ
-        R = e_R0 + h + rho * a * np.cos(thR)
-        Z = e_Z0 + v + k * rho * a * np.sin(thZ)
-        
-        thR_r, thR_th, thR_z = c0Rr + tRr, 1.0 + tRth, c0Rz + tRz
-        thZ_r, thZ_th, thZ_z = c0Zr + tZr, 1.0 + tZth, c0Zz + tZz
-        
-        Rr = hr + a * np.cos(thR) + rho * ar * np.cos(thR) - rho * a * np.sin(thR) * thR_r
-        Rt = -rho * a * np.sin(thR) * thR_th
-        Rz = hz + rho * az * np.cos(thR) - rho * a * np.sin(thR) * thR_z
-        
-        Zr = vr + kr * rho * a * np.sin(thZ) + k * a * np.sin(thZ) + k * rho * ar * np.sin(thZ) + k * rho * a * np.cos(thZ) * thZ_r
-        Zt = k * rho * a * np.cos(thZ) * thZ_th
-        Zz = vz + kz * rho * a * np.sin(thZ) + k * rho * az * np.sin(thZ) + k * rho * a * np.cos(thZ) * thZ_z
-
-        det_phys = Rr * Zt - Rt * Zr
-        det_safe = np.where(np.abs(det_phys) < 1e-13, -1e-13, det_phys)
-        sqrt_g = (R / self.Nt) * det_safe
-        
-        g_rr, g_tt = Rr**2 + Zr**2, Rt**2 + Zt**2
-        g_zz = Rz**2 + (R/self.Nt)**2 + Zz**2 
-        g_rt, g_rz, g_tz = Rr*Rt+Zr*Zt, Rr*Rz+Zr*Zz, Rt*Rz+Zt*Zz
-
-        lam_eff = np.sum(c_lam[:, :, None, None, None] * L_fac_rad[:, None, :, None, None], axis=0) 
-        Lt = np.sum(lam_eff * self.basis_lam_dth, axis=0) if self.len_lam > 0 else 0.0
-        Lz = np.sum(lam_eff * self.basis_lam_dze, axis=0) if self.len_lam > 0 else 0.0
-        
-        P, dP, psip, Phip = self.get_profiles(rho)
-        Bt_sup = (psip - Lz) / (2 * np.pi * sqrt_g)
-        Bz_sup = (Phip + Lt) / (2 * np.pi * sqrt_g)
-
-        Br_sub = g_rt * Bt_sup + g_rz * Bz_sup
-        Bt_sub = g_tt * Bt_sup + g_tz * Bz_sup
-        Bz_sub = g_tz * Bt_sup + g_zz * Bz_sup
-
-        dBt_drho = np.tensordot(self.D_matrix, Bt_sub, axes=(1, 0))
-        dBz_drho = np.tensordot(self.D_matrix, Bz_sub, axes=(1, 0))
-
-        Jz_sup = (dBt_drho - spectral_grad_th(Br_sub)) / sqrt_g
-        Jt_sup = (spectral_grad_ze(Br_sub) - dBz_drho) / sqrt_g
-        Jr_sup = (spectral_grad_th(Bz_sub) - spectral_grad_ze(Bt_sub)) / sqrt_g
-
-        Jr_phys = Jr_sup / self.mu_0
-        G_rho = dP - sqrt_g * (Jt_sup * Bz_sup - Jz_sup * Bt_sup) / self.mu_0
-        rho_R, rho_Z = Zt/det_safe, -Rt/det_safe
-        th_R, th_Z = -Zr/det_safe, Rr/det_safe
-        
-        GR = (rho_R * G_rho + (Jr_phys / (2 * np.pi)) * (th_R * (Phip + Lt)))
-        GZ = (rho_Z * G_rho + (Jr_phys / (2 * np.pi)) * (th_Z * (Phip + Lt)))
-
-        residuals = []
-        dV = self.dtheta * self.dzeta
-        def integrate(term): return np.sum(sqrt_g * term * self.weights_3d) * dV
-        
-        for L_idx in range(self.L_rad):
-            test_fac = fac_rad[L_idx, :, None, None]
-            for i in range(self.len_1d): residuals.append(integrate( GR * (-rho * a * np.sin(thR) * test_fac * self.basis_1d_val[i]) ))
-            for i in range(self.len_1d): residuals.append(integrate( GZ * (k * rho * a * np.cos(thZ) * test_fac * self.basis_1d_val[i]) ))
-            for i in range(self.len_1d): residuals.append(integrate( GR * (test_fac * self.basis_1d_val[i]) ))
-            for i in range(self.len_1d): residuals.append(integrate( GZ * (test_fac * self.basis_1d_val[i]) ))
-            for i in range(self.len_1d): residuals.append(integrate( GZ * (test_fac * rho * a * np.sin(thZ) * self.basis_1d_val[i]) ))
-            for i in range(self.len_1d): residuals.append(integrate( GR * (rho * np.cos(thR) * test_fac * self.basis_1d_val[i]) + GZ * (k * rho * np.sin(thZ) * test_fac * self.basis_1d_val[i]) ))
-                
-            for i in range(self.len_2d): residuals.append(integrate( GR * (-rho * a * np.sin(thR) * test_fac * self.basis_2d_val[i]) ))
-            for i in range(self.len_2d): residuals.append(integrate( GZ * (k * rho * a * np.cos(thZ) * test_fac * self.basis_2d_val[i]) ))
-                
-        for L_idx in range(self.L_rad):
-            test_L_fac = L_fac_rad[L_idx, :, None, None]
-            for i in range(self.len_lam): residuals.append(integrate( Jr_phys * (test_L_fac * self.basis_lam_val[i]) ))
-            
-        final_res = np.array(residuals)
-        if apply_scaling: 
-            final_res = final_res / self.res_scales
-            
-        if self.len_2d > 0:
-            idx_start = 6 * self.len_1d * self.L_rad
-            idx_end = idx_start + 2 * self.len_2d * self.L_rad
-            reg_penalty = x_core[idx_start:idx_end] * 1e-1
-            final_res = np.concatenate([final_res, reg_penalty])
-            
-        if np.any(det_phys > 1e-4):
-            penalty = np.sum(np.where(det_phys > 1e-4, 100.0 * (det_phys - 1e-4)**2, 0))
-            final_res = final_res * (1.0 + penalty)  
-            
-        return final_res
 
     def print_final_parameters(self, x_core):
         print("\n" + "="*110)
@@ -453,20 +606,6 @@ class VEQ3D_Solver:
             L_str = f"L_{m}_{n:<12} | {'-- Null --':>25} | " + " | ".join([f"{c_lam[L, i]:>22.8e}" for L in range(self.L_rad)])
             print(L_str)
         print("="*110 + "\n")
-
-    def solve(self):
-        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (修复手性与参数简并)...")
-        x0 = np.zeros(self.num_core_params)
-        
-        start_time = time.time()
-        res = least_squares(self.compute_physics, x0, method='trf', xtol=1e-10, ftol=1e-10, max_nfev=1500)
-        end_time = time.time()
-        
-        print(f">>> 核心物理平衡计算耗时: {end_time - start_time:.4f} 秒")
-        print(f">>> 最终收敛范数: {np.linalg.norm(res.fun):.4e}")
-        self.print_final_parameters(res.x)
-        self.plot_equilibrium(res.x)
-        return res.x
 
     def plot_equilibrium(self, x_core):
         zetas = [0, np.pi/3, 2*np.pi/3, np.pi, 4*np.pi/3, 5*np.pi/3]
