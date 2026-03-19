@@ -10,26 +10,35 @@ import time
 class VEQ3D_Solver:
     def __init__(self):
         # =========================================================
-        # [核心可调参数区] - 尝试高阶 N=3, L=3 测试
+        # [核心可调参数区] 自由调节极向 M、环向 N 与径向 L 阶数
         # =========================================================
         self.M_pol = 0
-        self.N_tor = 3
-        self.L_rad = 3
+        self.N_tor = 2
+        self.L_rad = 2
+        # =========================================================
         
         self.Nt = 19
         self.Phi_a = 1.0
         self.mu_0 = 4 * np.pi * 1e-7
         
-        # 初始只起占位作用，具体网格和模式在 solve() 中会被动态重构
+        # 保存目标高精度网格尺寸
+        self.target_Nr = 24
+        self.target_Nt = 32
+        self.target_Nz = 16
+        
+        self.p_edge = None  # 增加初始化，用于后续的边界热启动
+        
         self._setup_modes()
-        self.update_grid(24, 32, 16)
+        
+        # 初始化基础参数 (先以目标网格初始化，以确定参数长度)
+        self.update_grid(self.target_Nr, self.target_Nt, self.target_Nz)
         self._initialize_scaling()
 
-    def update_grid(self, Nr, Nt_grid, Nz_grid, p_edge_guess=None):
-        """动态网格重构引擎：支持在优化过程中无缝切换网格分辨率，自动修复奈奎斯特混叠"""
-        self.Nr = Nr + (Nr % 2)
-        self.Nt_grid = Nt_grid + (Nt_grid % 2)
-        self.Nz_grid = Nz_grid + (Nz_grid % 2)
+    def update_grid(self, Nr, Nt_grid, Nz_grid):
+        """动态网格重构引擎：支持在优化过程中无缝切换网格分辨率"""
+        self.Nr = Nr
+        self.Nt_grid = Nt_grid
+        self.Nz_grid = Nz_grid
         
         rho_nodes, self.rho_weights = self._get_chebyshev_nodes_and_weights(self.Nr)
         self.rho = 0.5 * (rho_nodes + 1)
@@ -48,12 +57,10 @@ class VEQ3D_Solver:
         self.RHO, self.TH, self.ZE = np.meshgrid(self.rho, self.theta, self.zeta, indexing='ij')
         self.weights_3d = self.rho_weights[:, None, None]
 
-        # 每次网格更新，必须重构实空间基底和边界
         self._build_basis_matrices()
-        self.fit_boundary(p_guess=p_edge_guess)
+        self.fit_boundary()
 
     def _setup_modes(self):
-        """动态重构截断阶数带来的自由度数组维度"""
         self.len_1d = 1 + 2 * self.N_tor
         
         self.modes_2d = []
@@ -142,11 +149,16 @@ class VEQ3D_Solver:
         return D
 
     def _initialize_scaling(self):
+        print(f">>> 参数体系已重构: 空间维度 (M={self.M_pol}, N={self.N_tor}, L={self.L_rad})")
+        print(f">>> 总优化参数量: {self.num_core_params} 个 (几何: {self.num_geom_params}, 流函数: {self.len_lam * self.L_rad})")
         self.res_scales = np.ones(self.num_core_params)
         self.res_scales[:self.num_geom_params] = 1e5
         self.res_scales[self.num_geom_params:] = 1e6
 
-    def fit_boundary(self, p_guess=None):
+    def compute_psi(self, rho):
+        return self.Phi_a * (rho**2 + 0.75 * rho**4)
+
+    def fit_boundary(self):
         TH_F, ZE_F = self.TH[0], self.ZE[0]
         R_target = 10 - np.cos(TH_F) - 0.3 * np.cos(TH_F + ZE_F)
         Z_target = np.sin(TH_F) - 0.3 * np.sin(TH_F + ZE_F)
@@ -174,9 +186,12 @@ class VEQ3D_Solver:
             res_reg = np.array([h_c[0], v_c[0]]) * 100.0
             return np.concatenate([res_geom, res_reg])
             
-        # 支持边界热启动，防止相位错乱跳变
-        if p_guess is not None and len(p_guess) == self.num_edge_params:
-            p0 = p_guess.copy()
+        # ==========================================================
+        # [极致优化]: 边界热启动机制
+        # 网格刷新时继承已有边界参数，杜绝“边界相位漂移冲击”
+        # ==========================================================
+        if self.p_edge is not None and len(self.p_edge) == self.num_edge_params:
+            p0 = self.p_edge.copy()
         else:
             p0 = np.zeros(self.num_edge_params)
             p0[0] = 10.0 
@@ -186,134 +201,6 @@ class VEQ3D_Solver:
         
         res = least_squares(boundary_residuals, p0, method='trf', ftol=1e-12)
         self.p_edge = res.x
-
-    # ==============================================================================
-    # [核心技术 2]: 谱空间多维降维热投影 (Spectral Parameter Transfer Engine)
-    # ==============================================================================
-    def _transfer_params(self, old_x, old_M, old_N, old_L):
-        old_len_1d = 1 + 2 * old_N
-        old_modes_2d = []
-        for m in range(1, old_M + 1):
-            for n in range(-old_N, old_N + 1):
-                old_modes_2d.extend([(m, n, 'c'), (m, n, 's')])
-        old_len_2d = len(old_modes_2d)
-        
-        old_lam_modes = []
-        for n in range(1, old_N + 1): old_lam_modes.append((0, n))
-        for m in range(1, old_M + 2):
-            for n in range(-old_N, old_N + 1):
-                old_lam_modes.append((m, n))
-        old_len_lam = len(old_lam_modes)
-        
-        idx = 0
-        def get_old(L_size):
-            nonlocal idx
-            if L_size == 0 or old_L == 0:
-                return np.zeros((old_L, 0))
-            c = old_x[idx:idx+L_size*old_L].reshape((old_L, L_size))
-            idx += L_size * old_L
-            return c
-            
-        o_c0R = get_old(old_len_1d)
-        o_c0Z = get_old(old_len_1d)
-        o_h   = get_old(old_len_1d)
-        o_v   = get_old(old_len_1d)
-        o_k   = get_old(old_len_1d)
-        o_a   = get_old(old_len_1d)
-        o_tR  = get_old(old_len_2d)
-        o_tZ  = get_old(old_len_2d)
-        o_lam = get_old(old_len_lam)
-        
-        new_x = np.zeros(self.num_core_params)
-        idx_new = 0
-        def put_new(old_arr, new_size, mapping=None):
-            nonlocal idx_new
-            if new_size == 0 or self.L_rad == 0:
-                return
-            c_new = np.zeros((self.L_rad, new_size))
-            transfer_L = min(old_L, self.L_rad)
-            
-            if transfer_L > 0 and old_arr.shape[1] > 0:
-                if mapping is None:
-                    transfer_size = min(old_arr.shape[1], new_size)
-                    c_new[:transfer_L, :transfer_size] = old_arr[:transfer_L, :transfer_size]
-                else:
-                    for old_i, new_i in mapping:
-                        if old_i < old_arr.shape[1] and new_i < new_size:
-                            c_new[:transfer_L, new_i] = old_arr[:transfer_L, old_i]
-                            
-            new_x[idx_new:idx_new+new_size*self.L_rad] = c_new.flatten()
-            idx_new += new_size * self.L_rad
-            
-        put_new(o_c0R, self.len_1d); put_new(o_c0Z, self.len_1d)
-        put_new(o_h,   self.len_1d); put_new(o_v,   self.len_1d)
-        put_new(o_k,   self.len_1d); put_new(o_a,   self.len_1d)
-        
-        map_2d = []
-        for i, mode in enumerate(old_modes_2d):
-            if mode in self.modes_2d:
-                map_2d.append((i, self.modes_2d.index(mode)))
-        put_new(o_tR, self.len_2d, mapping=map_2d)
-        put_new(o_tZ, self.len_2d, mapping=map_2d)
-        
-        map_lam = []
-        for i, mode in enumerate(old_lam_modes):
-            if mode in self.lambda_modes:
-                map_lam.append((i, self.lambda_modes.index(mode)))
-        put_new(o_lam, self.len_lam, mapping=map_lam)
-        
-        return new_x
-
-    def _transfer_edge_params(self, old_p, old_M, old_N):
-        """将已收敛的低阶边界参数无损投影至高阶空间，彻底杜绝边界-核心相位错乱脱节"""
-        if old_p is None: return None
-        old_len_1d = 1 + 2 * old_N
-        old_modes_2d = []
-        for m in range(1, old_M + 1):
-            for n in range(-old_N, old_N + 1):
-                old_modes_2d.extend([(m, n, 'c'), (m, n, 's')])
-        old_len_2d = len(old_modes_2d)
-
-        idx = 2
-        def get_old(L):
-            nonlocal idx
-            c = old_p[idx:idx+L]
-            idx += L
-            return c
-            
-        o_c0R = get_old(old_len_1d); o_c0Z = get_old(old_len_1d)
-        o_h   = get_old(old_len_1d); o_v   = get_old(old_len_1d)
-        o_k   = get_old(old_len_1d); o_a   = get_old(old_len_1d)
-        o_tR  = get_old(old_len_2d); o_tZ  = get_old(old_len_2d)
-
-        new_p = np.zeros(self.num_edge_params)
-        new_p[0], new_p[1] = old_p[0], old_p[1]
-        
-        idx_new = 2
-        def put_new(old_arr, new_size, mapping=None):
-            nonlocal idx_new
-            if new_size > 0:
-                if mapping is None:
-                    trans_size = min(len(old_arr), new_size)
-                    new_p[idx_new:idx_new+trans_size] = old_arr[:trans_size]
-                else:
-                    for o_i, n_i in mapping:
-                        if o_i < len(old_arr) and n_i < new_size:
-                            new_p[idx_new + n_i] = old_arr[o_i]
-                idx_new += new_size
-
-        put_new(o_c0R, self.len_1d); put_new(o_c0Z, self.len_1d)
-        put_new(o_h,   self.len_1d); put_new(o_v,   self.len_1d)
-        put_new(o_k,   self.len_1d); put_new(o_a,   self.len_1d)
-        
-        map_2d = []
-        for i, mode in enumerate(old_modes_2d):
-            if mode in self.modes_2d:
-                map_2d.append((i, self.modes_2d.index(mode)))
-        put_new(o_tR, self.len_2d, mapping=map_2d)
-        put_new(o_tZ, self.len_2d, mapping=map_2d)
-        
-        return new_p
 
     def _build_jax_residual_fn(self):
         RHO = jnp.array(self.RHO)
@@ -444,6 +331,7 @@ class VEQ3D_Solver:
             Zz = vz + kz * RHO * a * jnp.sin(thZ) + k * RHO * az * jnp.sin(thZ) + k * RHO * a * jnp.cos(thZ) * thZ_z
 
             det_phys = Rr * Zt - Rt * Zr
+            # 使用原汁原味的防御机制
             det_safe = jnp.where(jnp.abs(det_phys) < 1e-13, -1e-13, det_phys)
             
             sqrt_g = (R / Nt) * det_safe
@@ -542,12 +430,9 @@ class VEQ3D_Solver:
             if apply_scaling:
                 final_res = final_res / res_scales
                 
-            if len_2d > 0:
-                idx_start = 6 * len_1d * L_rad
-                idx_end = idx_start + 2 * len_2d * L_rad
-                reg_penalty = x_core[idx_start:idx_end] * 1e-1
-                final_res = jnp.concatenate([final_res, reg_penalty])
-                
+            # 完全去除 Tikhonov，保持纯净！
+            
+            # [修正符号Bug]: 恢复最原始的惩罚结构，但修复方向为 < 1e-5，防折叠自爆
             penalty = jnp.sum(jnp.where(det_phys < 1e-5, 100.0 * (1e-5 - det_phys)**2, 0.0))
             final_res = final_res * (1.0 + penalty)  
                 
@@ -556,6 +441,7 @@ class VEQ3D_Solver:
         return jax_res_fn
 
     def _run_optimization(self, x0, max_nfev, ftol):
+        """最原始的 TRF 调用，没有任何花里胡哨的缩放参数"""
         jax_res_fn = self._build_jax_residual_fn()
         
         @jax.jit
@@ -576,7 +462,6 @@ class VEQ3D_Solver:
             return np.array(jac_compiled(jnp.array(x)))
 
         start_time = time.time()
-        
         res = least_squares(
             fun_wrapped, 
             x0, 
@@ -594,93 +479,54 @@ class VEQ3D_Solver:
         return res
 
     def solve(self):
-        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (防混叠网格引擎 + 边界核心双重热投影)...")
+        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (极简纯净三级火箭版)...")
         
-        target_M, target_N, target_L = self.M_pol, self.N_tor, self.L_rad
+        # ==========================================================
+        # 网格自适应算法：自动推导满足 1/3 安全底线的网格，保证偶数防混叠
+        # ==========================================================
+        def make_even(x): return x + (x % 2)
+        c_Nr = make_even(max(8, 4 * self.L_rad + 2))
+        c_Nt = make_even(max(12, 4 * self.M_pol + 4))
+        c_Nz = make_even(max(8, 4 * self.N_tor + 2))
+
+        m_Nr = make_even(c_Nr + 6)
+        m_Nt = make_even(c_Nt + 8)
+        m_Nz = make_even(c_Nz + 4)
+
+        # ==========================================================
+        # 阶段 1：极粗网格寻向 (Extremely Coarse Grid) - 限制步数早停
+        # ==========================================================
+        print("\n" + "="*70)
+        print(f">>> [Phase 1/3]: 极粗网格冷启动寻向 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz})")
+        print("="*70)
+        self.update_grid(Nr=c_Nr, Nt_grid=c_Nt, Nz_grid=c_Nz)
+        x_guess = np.zeros(self.num_core_params)
         
-        schedule = []
-        max_steps = max(target_N, target_L)
-        for i in range(1, max_steps):
-            n = min(i, target_N)
-            l = min(i, target_L)
-            schedule.append((target_M, n, l))
-        if not schedule or schedule[-1] != (target_M, target_N, target_L):
-            schedule.append((target_M, target_N, target_L))
-            
-        x_current = None
-        old_p_edge = None
-        old_M, old_N, old_L = target_M, 0, 0
+        res_very_coarse = self._run_optimization(x_guess, max_nfev=30, ftol=1e-2)
+
+        # ==========================================================
+        # 阶段 2：中等网格精炼 (Medium Grid Refinement)
+        # ==========================================================
+        print("\n" + "="*70)
+        print(f">>> [Phase 2/3]: 中等网格形貌精炼 (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz})")
+        print("="*70)
+        self.update_grid(Nr=m_Nr, Nt_grid=m_Nt, Nz_grid=m_Nz)
         
-        for step_idx, (M, N, L) in enumerate(schedule):
-            is_final_step = (step_idx == len(schedule) - 1)
-            print("\n" + "★"*80)
-            step_name = "终极高维度收敛目标" if is_final_step else "低维子空间热启动铺垫"
-            print(f">>> [谱空间参数升维 {step_idx+1}/{len(schedule)}] {step_name} | 配置: M={M}, N={N}, L={L}")
-            print("★"*80)
-            
-            self.M_pol, self.N_tor, self.L_rad = M, N, L
-            self._setup_modes()
-            self._initialize_scaling()
-            
-            min_Nr = max(8, 2 * self.L_rad + 2)
-            min_Nt = max(12, 3 * self.M_pol + 4)
-            min_Nz = max(6,  3 * self.N_tor + 2)
-            
-            if x_current is None:
-                self.update_grid(min_Nr, min_Nt, min_Nz)
-                old_p_edge = self.p_edge  # 记录初代边界
-                x_guess = np.zeros(self.num_core_params)
-                print(f"    -> [阶段 A]: 极粗网格冷启动全域寻向 (Nr={self.Nr}, Nt={self.Nt_grid}, Nz={self.Nz_grid})")
-                res = self._run_optimization(x_guess, max_nfev=60, ftol=1e-2)
-                x_current = res.x
-            else:
-                # 核心修复：边界先行投影，核心紧随其后！保持相位绝对一致
-                new_p_edge = self._transfer_edge_params(old_p_edge, old_M, old_N)
-                x_current = self._transfer_params(x_current, old_M, old_N, old_L)
-                print(f"    -> [阶段 A]: 成功将低阶解 (N={old_N}, L={old_L}) 边界与核心联合热投影至当前空间，完美保留几何相位。")
-                
-                # 更新网格以注入带有新维度的热启动边界参数
-                self.update_grid(min_Nr, min_Nt, min_Nz, p_edge_guess=new_p_edge)
-                old_p_edge = self.p_edge  # 更新记录
-                
-                # =========================================================
-                # 【终极修复】新增：阶段 A 缓冲 (Phase A Buffer)
-                # 作用：让核心参数在计算成本极低的粗网格上，快速吸收和适应 N 升阶带来的边界形变冲击
-                # =========================================================
-                print(f"    -> [阶段 A 缓冲]: 粗网格吸收形变冲击 (Nr={self.Nr}, Nt={self.Nt_grid}, Nz={self.Nz_grid})")
-                res_buf = self._run_optimization(x_current, max_nfev=80, ftol=1e-3)
-                x_current = res_buf.x
-                # =========================================================
-                
-            if not is_final_step:
-                med_Nr, med_Nt, med_Nz = min_Nr + 4, min_Nt + 4, min_Nz + 2
-                self.update_grid(med_Nr, med_Nt, med_Nz, p_edge_guess=old_p_edge)
-                old_p_edge = self.p_edge
-                print(f"    -> [阶段 B]: 中等网格过渡快速精炼 (Nr={self.Nr}, Nt={self.Nt_grid}, Nz={self.Nz_grid})")
-                # 此时核心参数已经完全适应了新阶数的边界，可以轻松收敛
-                res = self._run_optimization(x_current, max_nfev=150, ftol=1e-6)
-                x_current = res.x
-            else:
-                med_Nr, med_Nt, med_Nz = min_Nr + 8, min_Nt + 8, min_Nz + 4
-                self.update_grid(med_Nr, med_Nt, med_Nz, p_edge_guess=old_p_edge)
-                old_p_edge = self.p_edge
-                print(f"    -> [阶段 B]: 中等网格形貌深度精炼 (Nr={self.Nr}, Nt={self.Nt_grid}, Nz={self.Nz_grid})")
-                res_med = self._run_optimization(x_current, max_nfev=200, ftol=1e-6)
-                
-                target_Nr = max(24, self.L_rad * 8 + 2)
-                target_Nt = max(32, self.M_pol * 8 + 8)
-                target_Nz = max(16, self.N_tor * 8 + 2)
-                self.update_grid(target_Nr, target_Nt, target_Nz, p_edge_guess=old_p_edge)
-                old_p_edge = self.p_edge
-                print(f"    -> [阶段 C]: 目标高保真网格极限收敛 (Nr={self.Nr}, Nt={self.Nt_grid}, Nz={self.Nz_grid})")
-                res_final = self._run_optimization(res_med.x, max_nfev=1500, ftol=1e-14)
-                x_current = res_final.x
-                
-            old_M, old_N, old_L = M, N, L
-            
-        self.print_final_parameters(x_current)
-        self.plot_equilibrium(x_current)
-        return x_current
+        res_coarse = self._run_optimization(res_very_coarse.x, max_nfev=60, ftol=1e-5)
+
+        # ==========================================================
+        # 阶段 3：目标高保真网格终极收敛 (Fine Grid Final Polish)
+        # ==========================================================
+        print("\n" + "="*70)
+        print(f">>> [Phase 3/3]: 高保真网格极限收敛 (Nr={self.target_Nr}, Nt={self.target_Nt}, Nz={self.target_Nz})")
+        print("="*70)
+        self.update_grid(self.target_Nr, self.target_Nt, self.target_Nz)
+        
+        res_fine = self._run_optimization(res_coarse.x, max_nfev=1000, ftol=1e-12)
+
+        self.print_final_parameters(res_fine.x)
+        self.plot_equilibrium(res_fine.x)
+        return res_fine.x
 
     def compute_geometry(self, x_core, rho, theta, zeta):
         rho, theta, zeta = np.atleast_1d(rho), np.atleast_1d(theta), np.atleast_1d(zeta)
